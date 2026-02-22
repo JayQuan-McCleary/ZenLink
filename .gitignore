@@ -4,3 +4,7 @@ __pycache__/
 *.png
 !icons/*.png
 .env
+
+web-ext-artifacts/
+.amo-upload-uuid
+*.xpi

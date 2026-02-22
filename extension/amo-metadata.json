@@ -1,0 +1,11 @@
+{
+  "categories": {
+    "firefox": ["other"]
+  },
+  "summary": {
+    "en-US": "Browser automation bridge - control Zen Browser or Firefox through a simple HTTP API from any tool, script, or AI assistant."
+  },
+  "version": {
+    "license": "MIT"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "manifest_version": 2,
+  "name": "ZenLink",
+  "version": "1.1.0",
+  "description": "Browser automation bridge - lets any tool control Zen Browser via HTTP",
+  "icons": {
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png"
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "<all_urls>",
+    "nativeMessaging"
+  ],
+  "background": {
+    "scripts": ["background/background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "zenlink@jayquan.dev",
+      "strict_min_version": "109.0"
+    }
+  }
+}
