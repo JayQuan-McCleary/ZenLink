@@ -54,6 +54,8 @@ POST http://localhost:8765/api/batch
 }
 ```
 
+
+
 ## Who Can Use This?
 
 | Tool | How it calls ZenLink |
