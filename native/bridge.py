@@ -4,6 +4,20 @@ Runs on localhost:8765 — Claude Desktop sends commands via HTTP,
 extension connects via WebSocket to receive and execute them.
 
 Usage: python bridge.py
+
+------------------------------------------------------------------------
+AI AGENT NOTICE -- READ BEFORE WRITING SCRAPING BATCH SEQUENCES
+------------------------------------------------------------------------
+Before writing any batch commands that scrape a known website, check:
+    D:\ZenLink\docs\scraping-playbooks\README.md
+Playbooks exist for sites that required non-obvious workarounds:
+  * amazon.md       -- bot detection / scroll-before-extract pattern
+  * bestbuy.md      -- lazy loading / window.scrollTo fix / 2026 selectors
+  * newegg.md       -- silent category redirects / use /p/pl?d= search URL
+  * bhphotovideo.md -- CSS Modules hashed classes / wildcard selector pattern
+Using a playbook avoids re-discovering the same failures from scratch.
+If you solve a new site, add a playbook so future agents benefit.
+------------------------------------------------------------------------
 """
 
 import asyncio
