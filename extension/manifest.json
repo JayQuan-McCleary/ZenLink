@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "name": "ZenLink",
+  "name": "Claude Bridge for Zen",
   "version": "1.1.0",
-  "description": "Browser automation bridge - lets any tool control Zen Browser via HTTP",
+  "description": "Lets Claude Desktop control Zen Browser via local bridge server",
   "icons": {
     "48": "icons/icon-48.png",
     "96": "icons/icon-96.png"
@@ -10,22 +10,14 @@
   "permissions": [
     "activeTab",
     "tabs",
-    "<all_urls>",
-    "nativeMessaging"
+    "<all_urls>"
   ],
   "background": {
     "scripts": ["background/background.js"]
   },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content/content.js"],
-      "run_at": "document_idle"
-    }
-  ],
   "browser_specific_settings": {
     "gecko": {
-      "id": "zenlink@jayquan.dev",
+      "id": "claude-bridge@jayquan.dev",
       "strict_min_version": "109.0"
     }
   }

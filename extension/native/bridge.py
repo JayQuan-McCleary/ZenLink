@@ -4,6 +4,20 @@ Runs on localhost:8765 — Claude Desktop sends commands via HTTP,
 extension connects via WebSocket to receive and execute them.
 
 Usage: python bridge.py
+
+------------------------------------------------------------------------
+AI AGENT NOTICE -- READ BEFORE WRITING SCRAPING BATCH SEQUENCES
+------------------------------------------------------------------------
+Before writing any batch commands that scrape a known website, check:
+    docs/scraping-playbooks/README.md   (relative to repo root)
+Playbooks exist for sites that required non-obvious workarounds:
+  * amazon.md       -- bot detection / scroll-before-extract pattern
+  * bestbuy.md      -- lazy loading / window.scrollTo fix / 2026 selectors
+  * newegg.md       -- silent category redirects / use /p/pl?d= search URL
+  * bhphotovideo.md -- CSS Modules hashed classes / wildcard selector pattern
+Using a playbook avoids re-discovering the same failures from scratch.
+If you solve a new site, add a playbook so future agents benefit.
+------------------------------------------------------------------------
 """
 
 import asyncio
@@ -81,7 +95,7 @@ async def send_to_extension(action, params=None, timeout=30):
         **(params or {})
     }
     
-    future = asyncio.get_event_loop().create_future()
+    future = asyncio.get_running_loop().create_future()
     pending_commands[cmd_id] = future
     
     try:
@@ -99,6 +113,75 @@ async def send_to_extension(action, params=None, timeout=30):
 # ══════════════════════════════════════════════
 #  HTTP API Server (Claude Desktop calls this)
 # ══════════════════════════════════════════════
+
+
+# Action name -> extension action name (for simple forwarding)
+BATCH_ACTION_MAP = {
+    'navigate':       'navigate',
+    'newTab':         'newTab',
+    'closeTab':       'closeTab',
+    'switchTab':      'switchTab',
+    'click':          'click',
+    'type':           'type',
+    'fill':           'fill',
+    'scroll':         'scroll',
+    'hover':          'hover',
+    'find':           'find',
+    'js':             'executeJS',
+    'pageInfo':       'getPageInfo',
+    'pageText':       'getPageText',
+    'pageTextByTabId':'getPageTextFromTab',
+    'tabs':           'getTabs',
+    'forms':          'getFormFields',
+    'dom':            'getAccessibilityTree',
+    'highlight':      'highlight',
+}
+
+
+async def run_command(cmd):
+    """Execute a single batch command asynchronously."""
+    action = cmd.get('action', '')
+    params = {k: v for k, v in cmd.items() if k != 'action'}
+    try:
+        # Simple forwarding actions (the majority)
+        if action in BATCH_ACTION_MAP:
+            return await send_to_extension(BATCH_ACTION_MAP[action], params)
+
+        # Actions with custom logic
+        if action == 'screenshot':
+            r = await send_to_extension('screenshot', params)
+            if 'dataUrl' in r:
+                os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+                img = base64.b64decode(r['dataUrl'].split(',')[1])
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                fp = os.path.join(SCREENSHOT_DIR, f'zen_{ts}.png')
+                with open(fp, 'wb') as f2: f2.write(img)
+                return {'saved_to': fp}
+            return r
+        elif action == 'waitForElement':
+            timeout_ms = params.get('timeout', 10000)
+            timeout_s = (timeout_ms / 1000) + 5
+            return await send_to_extension('waitForElement', params, timeout=timeout_s)
+        elif action == 'waitForResult':
+            timeout_ms = params.get('timeout', 15000)
+            timeout_s = (timeout_ms / 1000) + 5
+            return await send_to_extension('waitForResult', params, timeout=timeout_s)
+        elif action == 'sleep':
+            await asyncio.sleep(params.get('ms', 1000) / 1000)
+            return {'ok': True}
+        elif action == 'parallel':
+            sequences = params.get('sequences', [])
+            async def run_sequence(seq):
+                results = []
+                for c in seq:
+                    results.append(await run_command(c))
+                return results
+            return list(await asyncio.gather(*[run_sequence(s) for s in sequences]))
+        else:
+            return {'error': f'Unknown batch action: {action}'}
+    except Exception as e:
+        return {'error': str(e)}
+
 
 class BridgeHandler(BaseHTTPRequestHandler):
     
@@ -134,6 +217,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/api/close-tab": self.handle_close_tab,
             "/api/switch-tab": self.handle_switch_tab,
             "/api/new-tab": self.handle_new_tab,
+            "/api/wait-for-element": self.handle_wait_for_element,
+            "/api/wait-for-result": self.handle_wait_for_result,
+            "/api/page-text-by-tab-id": self.handle_page_text_by_tab_id,
             "/api/batch": self.handle_batch,
         }
         
@@ -260,64 +346,45 @@ class BridgeHandler(BaseHTTPRequestHandler):
         result = self.run_async(send_to_extension("newTab", body))
         self.send_json(200, result)
 
+    def handle_wait_for_element(self):
+        body = self.read_body()
+        # waitForElement can take up to timeout + buffer; extend the WS timeout accordingly
+        timeout_ms = body.get("timeout", 10000)
+        timeout_s = (timeout_ms / 1000) + 5
+        result = self.run_async(send_to_extension("waitForElement", body, timeout=timeout_s))
+        self.send_json(200, result)
+
+    def handle_wait_for_result(self):
+        body = self.read_body()
+        timeout_ms = body.get("timeout", 15000)
+        timeout_s = (timeout_ms / 1000) + 5
+        result = self.run_async(send_to_extension("waitForResult", body, timeout=timeout_s))
+        self.send_json(200, result)
+
+    def handle_page_text_by_tab_id(self):
+        body = self.read_body()
+        result = self.run_async(send_to_extension("getPageTextFromTab", body))
+        self.send_json(200, result)
+
     def handle_batch(self):
         body = self.read_body()
         commands = body.get('commands', [])
-        results = []
-        for cmd in commands:
-            action = cmd.get('action', '')
-            params = {k: v for k, v in cmd.items() if k != 'action'}
-            try:
-                if action == 'navigate':
-                    r = self.run_async(send_to_extension('navigate', params))
-                elif action == 'newTab':
-                    r = self.run_async(send_to_extension('newTab', params))
-                elif action == 'closeTab':
-                    r = self.run_async(send_to_extension('closeTab', params))
-                elif action == 'switchTab':
-                    r = self.run_async(send_to_extension('switchTab', params))
-                elif action == 'click':
-                    r = self.run_async(send_to_extension('click', params))
-                elif action == 'type':
-                    r = self.run_async(send_to_extension('type', params))
-                elif action == 'fill':
-                    r = self.run_async(send_to_extension('fill', params))
-                elif action == 'scroll':
-                    r = self.run_async(send_to_extension('scroll', params))
-                elif action == 'hover':
-                    r = self.run_async(send_to_extension('hover', params))
-                elif action == 'find':
-                    r = self.run_async(send_to_extension('find', params))
-                elif action == 'js':
-                    r = self.run_async(send_to_extension('executeJS', params))
-                elif action == 'pageInfo':
-                    r = self.run_async(send_to_extension('getPageInfo', params))
-                elif action == 'pageText':
-                    r = self.run_async(send_to_extension('getPageText', params))
-                elif action == 'screenshot':
-                    r = self.run_async(send_to_extension('screenshot', params))
-                    if 'dataUrl' in r:
-                        import base64, os, datetime
-                        img = base64.b64decode(r['dataUrl'].split(',')[1])
-                        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-                        fp = os.path.join(self.server.screenshot_dir, f'zen_{ts}.png')
-                        with open(fp, 'wb') as f: f.write(img)
-                        r = {'saved_to': fp}
-                elif action == 'tabs':
-                    r = self.run_async(send_to_extension('getTabs', params))
-                elif action == 'forms':
-                    r = self.run_async(send_to_extension('getFormFields', params))
-                elif action == 'dom':
-                    r = self.run_async(send_to_extension('getAccessibilityTree', params))
-                elif action == 'sleep':
-                    import time; time.sleep(params.get('ms', 1000) / 1000); r = {'ok': True}
-                else:
-                    r = {'error': f'Unknown batch action: {action}'}
+        stop_on_warning = body.get('stopOnWarning', False)
+
+        async def run_all():
+            results = []
+            for cmd in commands:
+                r = await run_command(cmd)
                 results.append(r)
-            except Exception as e:
-                results.append({'error': str(e)})
+                # Stop early if a command returned a warning/redirect and stopOnWarning is set
+                if stop_on_warning and isinstance(r, dict) and (r.get('warning') or r.get('error')):
+                    r['_stopped'] = True
+                    break
+            return results
+
+        results = self.run_async(run_all(), timeout=300)
         self.send_json(200, {'results': results})
-    
+
     # ── Helpers ──
     
     def read_body(self):
@@ -344,9 +411,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
     
-    def run_async(self, coro):
+    def run_async(self, coro, timeout=35):
         """Run async coroutine from sync HTTP handler."""
-        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=35)
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=timeout)
     
     def log_message(self, format, *args):
         print(f"[{now()}] HTTP {args[0]}" if args else "")
@@ -364,7 +431,7 @@ loop = None
 
 async def main():
     global loop
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     
     # Start WebSocket server
     ws_server = await ws_serve(ws_handler, "127.0.0.1", WS_PORT)
@@ -382,22 +449,24 @@ async def main():
     print(f"[{now()}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print()
     print("API Endpoints:")
-    print(f"  GET  http://localhost:{HTTP_PORT}/api/status      - Connection status")
-    print(f"  GET  http://localhost:{HTTP_PORT}/api/screenshot   - Capture page")
-    print(f"  GET  http://localhost:{HTTP_PORT}/api/page-info    - Page metadata")
-    print(f"  GET  http://localhost:{HTTP_PORT}/api/page-text    - Page text content")
-    print(f"  GET  http://localhost:{HTTP_PORT}/api/tabs         - List open tabs")
-    print(f"  GET  http://localhost:{HTTP_PORT}/api/dom          - Accessibility tree")
-    print(f"  GET  http://localhost:{HTTP_PORT}/api/forms        - Form fields")
-    print(f"  POST http://localhost:{HTTP_PORT}/api/click        - Click element")
-    print(f"  POST http://localhost:{HTTP_PORT}/api/type         - Type text")
-    print(f"  POST http://localhost:{HTTP_PORT}/api/scroll       - Scroll page")
-    print(f"  POST http://localhost:{HTTP_PORT}/api/hover        - Hover element")
-    print(f"  POST http://localhost:{HTTP_PORT}/api/fill         - Fill form field")
-    print(f"  POST http://localhost:{HTTP_PORT}/api/navigate     - Go to URL")
-    print(f"  POST http://localhost:{HTTP_PORT}/api/find         - Find elements")
-    print(f"  POST http://localhost:{HTTP_PORT}/api/js           - Execute JavaScript")
-    print(f"  POST http://localhost:{HTTP_PORT}/api/highlight    - Highlight element")
+    print(f"  GET  http://localhost:{HTTP_PORT}/api/status             - Connection status")
+    print(f"  GET  http://localhost:{HTTP_PORT}/api/screenshot          - Capture page")
+    print(f"  GET  http://localhost:{HTTP_PORT}/api/page-info           - Page metadata")
+    print(f"  GET  http://localhost:{HTTP_PORT}/api/page-text           - Page text content")
+    print(f"  GET  http://localhost:{HTTP_PORT}/api/tabs                - List open tabs")
+    print(f"  GET  http://localhost:{HTTP_PORT}/api/dom                 - Accessibility tree")
+    print(f"  GET  http://localhost:{HTTP_PORT}/api/forms               - Form fields")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/click               - Click element")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/type                - Type text")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/scroll              - Scroll page")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/hover               - Hover element")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/fill                - Fill form field")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/navigate            - Go to URL")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/find                - Find elements")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/js                  - Execute JavaScript")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/highlight           - Highlight element")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/wait-for-element    - Wait for element to appear")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/wait-for-result     - Poll JS expression until non-empty")
     print()
     
     # Keep running

@@ -169,6 +169,14 @@ async def run_command(cmd):
         elif action == 'sleep':
             await asyncio.sleep(params.get('ms', 1000) / 1000)
             return {'ok': True}
+        elif action == 'parallel':
+            sequences = params.get('sequences', [])
+            async def run_sequence(seq):
+                results = []
+                for c in seq:
+                    results.append(await run_command(c))
+                return results
+            return list(await asyncio.gather(*[run_sequence(s) for s in sequences]))
         else:
             return {'error': f'Unknown batch action: {action}'}
     except Exception as e:

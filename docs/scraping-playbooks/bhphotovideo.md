@@ -69,7 +69,7 @@ const rating = el.innerText?.match(/(\d+) Reviews/)?.[1];
   across deploys. This works for B&H and any other CSS-Modules-based site.
 - If `[class*="product_"]` stops matching, re-sniff with the class discovery
   snippet in Step 1 to find the new prefix.
-- B&H lazy-loads but `window.scrollTo` via JS works reliably (same as Best Buy).
+- B&H lazy-loads but `scroll` with `amount: 1` (one viewport height) works reliably (same as Best Buy).
 - `SortOrder=CustomerRankDsc` sorts by customer rating descending — most useful
   for "best" queries.
 - Watch out for nav/filter `[class*="item_"]` elements — they look similar but

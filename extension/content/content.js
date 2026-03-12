@@ -3,20 +3,29 @@
 
 (function() {
   'use strict';
-  const CONTENT_VERSION = 5;
+  const CONTENT_VERSION = 10;
   if (window.__claudeBridgeVersion >= CONTENT_VERSION) return;
   window.__claudeBridgeVersion = CONTENT_VERSION;
 
-  // Element reference map
+  // Element reference map (capped to prevent memory leaks in long sessions)
+  const REF_MAP_LIMIT = 10000;
   const refMap = {};
   let refCounter = 0;
+
+  function pruneRefMap() {
+    const keys = Object.keys(refMap);
+    if (keys.length > REF_MAP_LIMIT) {
+      // Drop oldest half
+      keys.slice(0, Math.floor(keys.length / 2)).forEach(k => delete refMap[k]);
+    }
+  }
 
   // ── Message Handler ──
   browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const handlers = {
       'ping':                  () => ({ ok: true, version: CONTENT_VERSION }),
       'getPageInfo':           () => getPageInfo(),
-      'getPageText':           () => getPageText(),
+      'getPageText':           () => getPageText(msg.selector),
       'getAccessibilityTree':  () => getAccessibilityTree(msg.depth || 6),
       'getFormFields':         () => getFormFields(),
       'click':                 () => clickElement(msg.selector, msg.coords),
@@ -28,6 +37,8 @@
       'executeJS':             () => executeJS(msg.code),
       'highlight':             () => highlightElement(msg.selector),
       'clearHighlight':        () => clearHighlight(),
+      'waitForElement':        () => waitForElement(msg.selector, msg.timeout, msg.pollInterval),
+      'waitForResult':         () => waitForResult(msg.code, msg.timeout, msg.pollInterval),
     };
 
     // Only respond if we're the latest version
@@ -38,7 +49,7 @@
     try {
       const result = handler();
       if (result && typeof result.then === 'function') {
-        // Async handler � keep message channel open
+        // Async handler — keep message channel open
         result.then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
         return true;
       }
@@ -68,19 +79,35 @@
   }
 
   // ── Page Text ──
-  function getPageText() {
+  const PAGE_TEXT_LIMIT = 20000;
+
+  function truncateText(raw) {
+    const truncated = raw.length > PAGE_TEXT_LIMIT;
+    return {
+      text: truncated ? raw.slice(0, PAGE_TEXT_LIMIT) : raw,
+      ...(truncated && { truncated: true, fullLength: raw.length }),
+    };
+  }
+
+  function getPageText(selector) {
+    if (selector) {
+      const el = document.querySelector(selector);
+      if (!el) return { error: 'Selector not found: ' + selector };
+      return truncateText(el.innerText);
+    }
     const selectors = ['article', '[role="main"]', 'main', '.content', '.post-content', '.article-body', '.entry-content'];
     for (const sel of selectors) {
       const el = document.querySelector(sel);
       if (el && el.innerText.length > 100) {
-        return { text: el.innerText.slice(0, 20000) };
+        return truncateText(el.innerText);
       }
     }
-    return { text: document.body.innerText.slice(0, 20000) };
+    return truncateText(document.body.innerText);
   }
 
   // ── Accessibility Tree ──
   function getAccessibilityTree(maxDepth) {
+    pruneRefMap();
     refCounter = 0;
     
     function buildNode(el, depth) {
@@ -142,6 +169,7 @@
 
   // ── Find Elements ──
   function findElements(query) {
+    pruneRefMap();
     const q = query.toLowerCase();
     const results = [];
 
@@ -269,7 +297,10 @@
   // ── Scroll ──
   function scrollPage(direction, amount, selector) {
     const target = selector ? resolveElement(selector) : null;
-    const dist = amount || 500;
+    // amount now means viewport-heights (1 = one full viewport, default = 1)
+    // This ensures lazy-loading intersection observers actually trigger
+    const viewportH = window.innerHeight;
+    const dist = Math.round((amount || 1) * viewportH);
     const opts = { behavior: 'smooth' };
 
     if (direction === 'top') {
@@ -281,7 +312,7 @@
       (target || window).scrollBy({ ...deltas[direction || 'down'], ...opts });
     }
 
-    return { ok: true, scrollY: window.scrollY, scrollX: window.scrollX };
+    return { ok: true, scrollY: window.scrollY, scrollX: window.scrollX, scrolledPx: dist };
   }
 
   // ── Hover ──
@@ -305,7 +336,7 @@
     let result;
     try { result = fillField(selector, value); } catch(e) { result = { error: e.message }; }
     if (result.error && (result.error.includes('HTMLInputElement') || result.error.includes('HTMLTextAreaElement'))) {
-      // Shadow DOM not accessible from content script � use page context
+      // Shadow DOM not accessible from content script — use page context
       const pageResult = await fillViaPageContext(selector, value);
       if (pageResult.startsWith('ok:')) {
         return { ok: true, pierced: true, method: 'pageContext', tag: pageResult.split(':')[1].toLowerCase() };
@@ -387,7 +418,7 @@
     const child = el.querySelector('input, textarea, select');
     if (child) return child;
 
-    // Closed shadow root � try page context access via wrappedJSObject (Firefox)
+    // Closed shadow root — try page context access via wrappedJSObject (Firefox)
     try {
       const unwrapped = el.wrappedJSObject || el;
       if (unwrapped.shadowRoot) {
@@ -428,13 +459,98 @@
   }
 
   // ── Execute JS ──
+  const JS_RESULT_LIMIT = 50000; // 50KB cap to avoid blowing up WebSocket
+
   function executeJS(code) {
     try {
       const result = eval(code);
-      return { result: String(result)?.slice(0, 5000) };
+      const str = String(result ?? '');
+      const truncated = str.length > JS_RESULT_LIMIT;
+      return {
+        result: truncated ? str.slice(0, JS_RESULT_LIMIT) : str,
+        ...(truncated && { truncated: true, fullLength: str.length }),
+      };
     } catch (e) {
       return { error: e.message };
     }
+  }
+
+  // ── Wait For Element ──
+  function waitForElement(selector, timeout, pollInterval) {
+    const maxWait = timeout || 10000;
+    const interval = pollInterval || 200;
+    const start = Date.now();
+
+    return new Promise((resolve) => {
+      function poll() {
+        const el = document.querySelector(selector);
+        if (el && !isHidden(el)) {
+          const elapsed = Date.now() - start;
+          const ref = `r${refCounter++}`;
+          refMap[ref] = el;
+          resolve({
+            ok: true,
+            found: true,
+            selector,
+            elapsed,
+            ref,
+            tag: el.tagName.toLowerCase(),
+            text: (el.textContent || '').trim().slice(0, 120),
+          });
+        } else if (Date.now() - start >= maxWait) {
+          resolve({
+            ok: false,
+            found: false,
+            selector,
+            elapsed: Date.now() - start,
+            error: `Timed out after ${maxWait}ms waiting for "${selector}"`,
+          });
+        } else {
+          setTimeout(poll, interval);
+        }
+      }
+      poll();
+    });
+  }
+
+  // ── Wait For Result (poll JS expression until non-empty) ──
+  function waitForResult(code, timeout, pollInterval) {
+    const maxWait = timeout || 15000;
+    const interval = pollInterval || 500;
+    const start = Date.now();
+
+    return new Promise((resolve) => {
+      function poll() {
+        try {
+          const raw = eval(code);
+          const result = String(raw ?? '');
+          // Treat non-empty, non-null, non-undefined, non-"[]", non-"null" as success
+          if (result && result !== 'undefined' && result !== 'null' && result !== '[]' && result !== '""') {
+            resolve({
+              ok: true,
+              result: result.slice(0, JS_RESULT_LIMIT),
+              elapsed: Date.now() - start,
+              polls: Math.floor((Date.now() - start) / interval) + 1,
+            });
+            return;
+          }
+        } catch (e) {
+          // Expression threw — keep polling (page may still be hydrating)
+        }
+
+        if (Date.now() - start >= maxWait) {
+          resolve({
+            ok: false,
+            result: null,
+            elapsed: Date.now() - start,
+            error: `Timed out after ${maxWait}ms — expression never returned non-empty result`,
+          });
+        } else {
+          setTimeout(poll, interval);
+        }
+      }
+      poll();
+    });
   }
 
   // ── Highlight ──

@@ -3,7 +3,7 @@
 
 'use strict';
 
-const EXPECTED_CONTENT_VERSION = 5;
+const EXPECTED_CONTENT_VERSION = 10;
 const WS_URL = 'ws://127.0.0.1:8766';
 let ws = null;
 let reconnectTimer = null;
@@ -143,6 +143,7 @@ async function injectAllTabs() {
 
 function isRestrictedUrl(url) {
   if (!url) return true;
+  if (url === 'about:blank') return false;  // blank tabs may have loaded content - let sendMessage decide
   return url.startsWith('about:') ||
          url.startsWith('moz-extension:') ||
          url.startsWith('chrome:') ||
@@ -160,10 +161,11 @@ async function handleCommand(command) {
     // Browser-level commands (handled here)
     case 'screenshot':   return await captureScreenshot();
     case 'getTabs':      return await getOpenTabs();
-    case 'navigate':     return await navigateTab(params.url, params.tabId);
+    case 'navigate':     return await navigateTab(params.url, params.tabId, params.expectTitle);
     case 'switchTab':    return await switchTab(params.tabId);
     case 'newTab':       return await createTab(params.url);
     case 'closeTab':     return await closeTab(params.tabId);
+    case 'getPageTextFromTab': return await forwardToContent('getPageText', params);
     
     // Content script commands (forwarded to active tab)
     case 'getPageInfo':
@@ -179,6 +181,8 @@ async function handleCommand(command) {
     case 'executeJS':
     case 'highlight':
     case 'clearHighlight':
+    case 'waitForElement':
+    case 'waitForResult':
       return await forwardToContent(action, params);
     
     default:
@@ -219,12 +223,42 @@ async function getOpenTabs() {
   }
 }
 
-async function navigateTab(url, tabId) {
+async function navigateTab(url, tabId, expectTitle) {
   try {
     const targetTabId = tabId || (await getActiveTabId());
     if (!targetTabId) return { error: 'No active tab' };
     await browser.tabs.update(targetTabId, { url });
-    return { ok: true, url };
+
+    // Wait for page to finish loading before returning
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        browser.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }, 15000);
+
+      function listener(updatedTabId, changeInfo, tab) {
+        if (updatedTabId === targetTabId && changeInfo.status === 'complete' && tab.url && !tab.url.startsWith('about:')) {
+          clearTimeout(timeout);
+          browser.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      }
+      browser.tabs.onUpdated.addListener(listener);
+    });
+
+    // Check if page title matches expectation (catches silent redirects)
+    const result = { ok: true, url };
+    if (expectTitle) {
+      const tab = await browser.tabs.get(targetTabId);
+      const title = tab.title || '';
+      const match = title.toLowerCase().includes(expectTitle.toLowerCase());
+      result.title = title;
+      if (!match) {
+        result.warning = `Title "${title}" does not contain expected "${expectTitle}" — possible redirect`;
+        result.redirected = true;
+      }
+    }
+    return result;
   } catch (e) {
     return { error: e.message };
   }
