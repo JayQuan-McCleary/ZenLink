@@ -115,55 +115,49 @@ async def send_to_extension(action, params=None, timeout=30):
 # ══════════════════════════════════════════════
 
 
-async def run_command(cmd, _screenshot_dir='C:/Users/jayqu/claude-zen-screenshots'):
+# Action name -> extension action name (for simple forwarding)
+BATCH_ACTION_MAP = {
+    'navigate':       'navigate',
+    'newTab':         'newTab',
+    'closeTab':       'closeTab',
+    'switchTab':      'switchTab',
+    'click':          'click',
+    'type':           'type',
+    'fill':           'fill',
+    'scroll':         'scroll',
+    'hover':          'hover',
+    'find':           'find',
+    'js':             'executeJS',
+    'pageInfo':       'getPageInfo',
+    'pageText':       'getPageText',
+    'pageTextByTabId':'getPageTextFromTab',
+    'tabs':           'getTabs',
+    'forms':          'getFormFields',
+    'dom':            'getAccessibilityTree',
+    'highlight':      'highlight',
+}
+
+
+async def run_command(cmd):
     """Execute a single batch command asynchronously."""
-    import base64, os, datetime
     action = cmd.get('action', '')
     params = {k: v for k, v in cmd.items() if k != 'action'}
     try:
-        if action == 'navigate':
-            return await send_to_extension('navigate', params)
-        elif action == 'newTab':
-            return await send_to_extension('newTab', params)
-        elif action == 'closeTab':
-            return await send_to_extension('closeTab', params)
-        elif action == 'switchTab':
-            return await send_to_extension('switchTab', params)
-        elif action == 'click':
-            return await send_to_extension('click', params)
-        elif action == 'type':
-            return await send_to_extension('type', params)
-        elif action == 'fill':
-            return await send_to_extension('fill', params)
-        elif action == 'scroll':
-            return await send_to_extension('scroll', params)
-        elif action == 'hover':
-            return await send_to_extension('hover', params)
-        elif action == 'find':
-            return await send_to_extension('find', params)
-        elif action == 'js':
-            return await send_to_extension('executeJS', params)
-        elif action == 'pageInfo':
-            return await send_to_extension('getPageInfo', params)
-        elif action == 'pageText':
-            return await send_to_extension('getPageText', params)
-        elif action == 'pageTextByTabId':
-            return await send_to_extension('getPageTextFromTab', params)
-        elif action == 'screenshot':
+        # Simple forwarding actions (the majority)
+        if action in BATCH_ACTION_MAP:
+            return await send_to_extension(BATCH_ACTION_MAP[action], params)
+
+        # Actions with custom logic
+        if action == 'screenshot':
             r = await send_to_extension('screenshot', params)
             if 'dataUrl' in r:
+                os.makedirs(SCREENSHOT_DIR, exist_ok=True)
                 img = base64.b64decode(r['dataUrl'].split(',')[1])
-                ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-                fp = os.path.join(_screenshot_dir, f'zen_{ts}.png')
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                fp = os.path.join(SCREENSHOT_DIR, f'zen_{ts}.png')
                 with open(fp, 'wb') as f2: f2.write(img)
                 return {'saved_to': fp}
             return r
-        elif action == 'tabs':
-            return await send_to_extension('getTabs', params)
-        elif action == 'forms':
-            return await send_to_extension('getFormFields', params)
-        elif action == 'dom':
-            return await send_to_extension('getAccessibilityTree', params)
         elif action == 'waitForElement':
             timeout_ms = params.get('timeout', 10000)
             timeout_s = (timeout_ms / 1000) + 5
@@ -173,8 +167,7 @@ async def run_command(cmd, _screenshot_dir='C:/Users/jayqu/claude-zen-screenshot
             timeout_s = (timeout_ms / 1000) + 5
             return await send_to_extension('waitForResult', params, timeout=timeout_s)
         elif action == 'sleep':
-            import asyncio as _asyncio
-            await _asyncio.sleep(params.get('ms', 1000) / 1000)
+            await asyncio.sleep(params.get('ms', 1000) / 1000)
             return {'ok': True}
         else:
             return {'error': f'Unknown batch action: {action}'}
@@ -368,82 +361,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def handle_batch(self):
         body = self.read_body()
         commands = body.get('commands', [])
+        stop_on_warning = body.get('stopOnWarning', False)
 
         async def run_all():
             results = []
             for cmd in commands:
                 r = await run_command(cmd)
                 results.append(r)
+                # Stop early if a command returned a warning/redirect and stopOnWarning is set
+                if stop_on_warning and isinstance(r, dict) and (r.get('warning') or r.get('error')):
+                    r['_stopped'] = True
+                    break
             return results
 
         results = self.run_async(run_all(), timeout=300)
         self.send_json(200, {'results': results})
 
-    def _batch_placeholder(self):
-        pass  # replaced by run_command below
-
-    def handle_batch_OLD_SEQUENTIAL(self):
-        body = self.read_body()
-        commands = body.get('commands', [])
-        results = []
-        for cmd in commands:
-            action = cmd.get('action', '')
-            params = {k: v for k, v in cmd.items() if k != 'action'}
-            try:
-                if action == 'navigate':
-                    r = self.run_async(send_to_extension('navigate', params))
-                elif action == 'newTab':
-                    r = self.run_async(send_to_extension('newTab', params))
-                elif action == 'closeTab':
-                    r = self.run_async(send_to_extension('closeTab', params))
-                elif action == 'switchTab':
-                    r = self.run_async(send_to_extension('switchTab', params))
-                elif action == 'click':
-                    r = self.run_async(send_to_extension('click', params))
-                elif action == 'type':
-                    r = self.run_async(send_to_extension('type', params))
-                elif action == 'fill':
-                    r = self.run_async(send_to_extension('fill', params))
-                elif action == 'scroll':
-                    r = self.run_async(send_to_extension('scroll', params))
-                elif action == 'hover':
-                    r = self.run_async(send_to_extension('hover', params))
-                elif action == 'find':
-                    r = self.run_async(send_to_extension('find', params))
-                elif action == 'js':
-                    r = self.run_async(send_to_extension('executeJS', params))
-                elif action == 'pageInfo':
-                    r = self.run_async(send_to_extension('getPageInfo', params))
-                elif action == 'pageText':
-                    r = self.run_async(send_to_extension('getPageText', params))
-                elif action == 'screenshot':
-                    r = self.run_async(send_to_extension('screenshot', params))
-                    if 'dataUrl' in r:
-                        import base64, os, datetime
-                        img = base64.b64decode(r['dataUrl'].split(',')[1])
-                        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-                        fp = os.path.join(self.server.screenshot_dir, f'zen_{ts}.png')
-                        with open(fp, 'wb') as f: f.write(img)
-                        r = {'saved_to': fp}
-                elif action == 'tabs':
-                    r = self.run_async(send_to_extension('getTabs', params))
-                elif action == 'forms':
-                    r = self.run_async(send_to_extension('getFormFields', params))
-                elif action == 'dom':
-                    r = self.run_async(send_to_extension('getAccessibilityTree', params))
-                elif action == 'waitForElement':
-                    timeout_ms = params.get('timeout', 10000)
-                    timeout_s = (timeout_ms / 1000) + 5
-                    r = self.run_async(send_to_extension('waitForElement', params, timeout=timeout_s))
-                elif action == 'sleep':
-                    import time; time.sleep(params.get('ms', 1000) / 1000); r = {'ok': True}
-                else:
-                    r = {'error': f'Unknown batch action: {action}'}
-                results.append(r)
-            except Exception as e:
-                results.append({'error': str(e)})
-        self.send_json(200, {'results': results})
-    
     # ── Helpers ──
     
     def read_body(self):

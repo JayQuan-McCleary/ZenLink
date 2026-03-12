@@ -45,11 +45,9 @@ observers. Repeat with sleeps between to let cards render:
 ```
 
 ### CSS Modules sites (B&H and any site with `word_hash` class names)
-Sniff the live class prefix, then use wildcard attribute selector:
-```json
-{ "action": "js", "code": "JSON.stringify([...new Set([...document.querySelectorAll('[class]')].flatMap(e => [...e.classList]).filter(c => /^(item|product|card|result)_[a-zA-Z0-9]+$/.test(c)))].slice(0,10))" }
-```
-Then query: `document.querySelectorAll('[class*="product_"]')`
+Use `[class*="prefix_"]` wildcard selectors — the prefix before the underscore
+is stable across deploys. See [bhphotovideo.md](./bhphotovideo.md) for the full
+pattern and a class-discovery snippet in the appendix.
 
 ### Bot-detection sites (Amazon)
 - Use real browser navigation via `navigate` action only
