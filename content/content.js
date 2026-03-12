@@ -3,13 +3,22 @@
 
 (function() {
   'use strict';
-  const CONTENT_VERSION = 8;
+  const CONTENT_VERSION = 9;
   if (window.__claudeBridgeVersion >= CONTENT_VERSION) return;
   window.__claudeBridgeVersion = CONTENT_VERSION;
 
-  // Element reference map
+  // Element reference map (capped to prevent memory leaks in long sessions)
+  const REF_MAP_LIMIT = 10000;
   const refMap = {};
   let refCounter = 0;
+
+  function pruneRefMap() {
+    const keys = Object.keys(refMap);
+    if (keys.length > REF_MAP_LIMIT) {
+      // Drop oldest half
+      keys.slice(0, Math.floor(keys.length / 2)).forEach(k => delete refMap[k]);
+    }
+  }
 
   // ── Message Handler ──
   browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -88,6 +97,7 @@
 
   // ── Accessibility Tree ──
   function getAccessibilityTree(maxDepth) {
+    pruneRefMap();
     refCounter = 0;
     
     function buildNode(el, depth) {
@@ -149,6 +159,7 @@
 
   // ── Find Elements ──
   function findElements(query) {
+    pruneRefMap();
     const q = query.toLowerCase();
     const results = [];
 
@@ -438,10 +449,17 @@
   }
 
   // ── Execute JS ──
+  const JS_RESULT_LIMIT = 50000; // 50KB cap to avoid blowing up WebSocket
+
   function executeJS(code) {
     try {
       const result = eval(code);
-      return { result: String(result)?.slice(0, 5000) };
+      const str = String(result ?? '');
+      const truncated = str.length > JS_RESULT_LIMIT;
+      return {
+        result: truncated ? str.slice(0, JS_RESULT_LIMIT) : str,
+        ...(truncated && { truncated: true, fullLength: str.length }),
+      };
     } catch (e) {
       return { error: e.message };
     }
@@ -500,7 +518,7 @@
           if (result && result !== 'undefined' && result !== 'null' && result !== '[]' && result !== '""') {
             resolve({
               ok: true,
-              result: result.slice(0, 5000),
+              result: result.slice(0, JS_RESULT_LIMIT),
               elapsed: Date.now() - start,
               polls: Math.floor((Date.now() - start) / interval) + 1,
             });

@@ -1,14 +1,14 @@
 # ZenLink
 
-Browser automation bridge for Zen Browser & Firefox — control your browser through a simple HTTP API.
+Browser automation bridge for Zen Browser & Firefox ï¿½ control your browser through a simple HTTP API.
 
 Built as a fast, working alternative to Chrome MCP. Works with any AI assistant, automation tool, or script that can make HTTP requests.
 
 ## Why ZenLink?
 
-AI desktop assistants (Claude, ChatGPT, Copilot, etc.) often need to interact with your browser — filling forms, reading pages, taking screenshots, navigating sites. Most solutions are either Chrome-only, buggy, or require complex setup.
+AI desktop assistants (Claude, ChatGPT, Copilot, etc.) often need to interact with your browser ï¿½ filling forms, reading pages, taking screenshots, navigating sites. Most solutions are either Chrome-only, buggy, or require complex setup.
 
-ZenLink is a lightweight HTTP bridge that gives **anything that can call `curl` or `fetch`** full control over Zen Browser or Firefox. No special SDK, no proprietary protocol — just REST endpoints on localhost.
+ZenLink is a lightweight HTTP bridge that gives **anything that can call `curl` or `fetch`** full control over Zen Browser or Firefox. No special SDK, no proprietary protocol ï¿½ just REST endpoints on localhost.
 
 ## How It Works
 
@@ -25,7 +25,7 @@ ZenLink Browser Extension
     |
     |  browser.tabs API + content scripts
     v
-Web Page DOM — click, type, read, screenshot, etc.
+Web Page DOM ï¿½ click, type, read, screenshot, etc.
 ```
 
 **The key idea:** Your AI assistant has shell access (terminal, PowerShell, bash). It sends HTTP requests to ZenLink's local server. The server relays commands to the browser extension over WebSocket. The extension executes them in the actual browser tab and returns results.
@@ -37,7 +37,7 @@ Web Page DOM — click, type, read, screenshot, etc.
 3. **AI runs:** `curl -X POST localhost:8765/api/fill -d '{"selector":"#email","value":"me@example.com"}'`
 4. **AI runs:** `curl -X POST localhost:8765/api/fill -d '{"selector":"#password","value":"secret"}'`
 5. **AI runs:** `curl -X POST localhost:8765/api/click -d '{"selector":"#submit"}'`
-6. **Browser:** Navigates, fills fields, clicks submit — you're logged in.
+6. **Browser:** Navigates, fills fields, clicks submit ï¿½ you're logged in.
 
 Or with the **batch endpoint** (one request, multiple commands):
 
@@ -112,23 +112,25 @@ curl http://localhost:8765/api/status
 
 | Endpoint | Body | Description |
 |----------|------|-------------|
-| `/api/navigate` | `{"url": "..."}` | Load URL in active tab |
+| `/api/navigate` | `{"url": "...", "expectTitle": "..."}` | Load URL (optional title check for redirect detection) |
 | `/api/new-tab` | `{"url": "..."}` | Open URL in new tab |
 | `/api/close-tab` | `{"tabId": 123}` | Close tab by ID |
 | `/api/switch-tab` | `{"tabId": 123}` | Focus a tab |
 | `/api/click` | `{"selector": "..."}` or `{"coords": {"x":0,"y":0}}` | Click element |
 | `/api/type` | `{"selector": "...", "text": "...", "clear": true}` | Type into input |
 | `/api/fill` | `{"selector": "...", "value": "..."}` | Set form field value |
-| `/api/scroll` | `{"direction": "down", "amount": 500}` | Scroll page |
+| `/api/scroll` | `{"direction": "down", "amount": 1}` | Scroll page (`amount` = viewport heights, default 1) |
 | `/api/hover` | `{"selector": "..."}` | Hover over element |
 | `/api/find` | `{"query": "login button"}` | Find elements by description |
-| `/api/js` | `{"code": "document.title"}` | Execute JavaScript |
+| `/api/js` | `{"code": "document.title"}` | Execute JavaScript (50KB result limit, returns `truncated: true` if exceeded) |
 | `/api/highlight` | `{"selector": "..."}` | Visual overlay on element |
-| `/api/batch` | `{"commands": [...]}` | Run multiple commands at once |
+| `/api/wait-for-element` | `{"selector": "...", "timeout": 10000}` | Poll until element appears in DOM |
+| `/api/wait-for-result` | `{"code": "...", "timeout": 15000}` | Poll JS expression until it returns non-empty |
+| `/api/batch` | `{"commands": [...], "stopOnWarning": true}` | Run multiple commands (stops on warning/error if flag set) |
 
 ### Batch Commands
 
-Send multiple commands in a single request — significantly faster than individual calls:
+Send multiple commands in a single request ï¿½ significantly faster than individual calls:
 
 ```json
 POST http://localhost:8765/api/batch
@@ -144,13 +146,17 @@ POST http://localhost:8765/api/batch
 }
 ```
 
-Available batch actions: `navigate`, `newTab`, `closeTab`, `switchTab`, `click`, `type`, `fill`, `scroll`, `hover`, `find`, `js`, `pageInfo`, `pageText`, `screenshot`, `tabs`, `forms`, `dom`, `sleep`
+Available batch actions: `navigate`, `newTab`, `closeTab`, `switchTab`, `click`, `type`, `fill`, `scroll`, `hover`, `find`, `js`, `pageInfo`, `pageText`, `screenshot`, `tabs`, `forms`, `dom`, `highlight`, `waitForElement`, `waitForResult`, `sleep`
+
+**`stopOnWarning`**: Set to `true` to halt batch execution if any command returns a `warning` (e.g. `expectTitle` redirect mismatch) or `error`. The halting result will include `_stopped: true`.
+
+**`expectTitle`** on navigate: Pass `"expectTitle": "keyword"` to check the loaded page title. If the title doesn't contain the keyword (case-insensitive), the result includes `warning` and `redirected: true` â€” useful for catching silent URL redirects.
 
 ### Element Targeting
 
 Multiple ways to target elements:
 - **CSS selector**: `#id`, `.class`, `input[name=email]`
-- **Ref ID**: `r0`, `r5` — returned by `/api/find` and `/api/dom`
+- **Ref ID**: `r0`, `r5` ï¿½ returned by `/api/find` and `/api/dom`
 - **Coordinates**: `{"coords": {"x": 100, "y": 200}}`
 
 ## Usage Examples
@@ -192,15 +198,17 @@ const {title} = await (await fetch("http://localhost:8765/api/page-info")).json(
 
 ## Features
 
-- **Full page control** — navigate, click, type, scroll, hover, fill forms
-- **Smart element finding** — natural language queries, CSS selectors, coordinates, or ref IDs
-- **Tab management** — open, close, switch, list tabs
-- **Screenshots** — capture viewport as PNG
-- **JavaScript execution** — run arbitrary JS in page context
-- **Batch commands** — multiple commands in one request for speed
-- **Shadow DOM support** — auto-pierces open shadow roots for modern web components
-- **Auto-reconnect** — extension reconnects with exponential backoff after bridge restart
-- **Content script versioning** — updated scripts auto-inject without page refresh
+- **Full page control** ï¿½ navigate, click, type, scroll, hover, fill forms
+- **Smart element finding** ï¿½ natural language queries, CSS selectors, coordinates, or ref IDs
+- **Tab management** ï¿½ open, close, switch, list tabs
+- **Screenshots** ï¿½ capture viewport as PNG
+- **JavaScript execution** ï¿½ run arbitrary JS in page context (50KB result cap with truncation flag)
+- **Batch commands** ï¿½ multiple commands in one request, with `stopOnWarning` for early abort
+- **Wait primitives** ï¿½ `waitForElement` and `waitForResult` poll until DOM/data is ready
+- **Redirect detection** ï¿½ `expectTitle` on navigate catches silent URL redirects
+- **Shadow DOM support** ï¿½ auto-pierces open shadow roots for modern web components
+- **Auto-reconnect** ï¿½ extension reconnects with exponential backoff after bridge restart
+- **Content script versioning** ï¿½ updated scripts auto-inject without page refresh
 
 ## Known Limitations
 
@@ -220,4 +228,4 @@ Built out of frustration with Chrome MCP being broken. Originally created to giv
 
 ## License
 
-MIT — do whatever you want with it.
+MIT ï¿½ do whatever you want with it.
