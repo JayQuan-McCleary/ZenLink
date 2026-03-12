@@ -3,7 +3,7 @@
 
 'use strict';
 
-const EXPECTED_CONTENT_VERSION = 9;
+const EXPECTED_CONTENT_VERSION = 10;
 const WS_URL = 'ws://127.0.0.1:8766';
 let ws = null;
 let reconnectTimer = null;

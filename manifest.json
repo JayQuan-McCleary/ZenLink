@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Claude Bridge for Zen",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Lets Claude Desktop control Zen Browser via local bridge server",
   "icons": {
     "48": "icons/icon-48.png",
@@ -10,19 +10,11 @@
   "permissions": [
     "activeTab",
     "tabs",
-    "<all_urls>",
-    "nativeMessaging"
+    "<all_urls>"
   ],
   "background": {
     "scripts": ["background/background.js"]
   },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content/content.js"],
-      "run_at": "document_idle"
-    }
-  ],
   "browser_specific_settings": {
     "gecko": {
       "id": "claude-bridge@jayquan.dev",

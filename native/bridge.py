@@ -95,7 +95,7 @@ async def send_to_extension(action, params=None, timeout=30):
         **(params or {})
     }
     
-    future = asyncio.get_event_loop().create_future()
+    future = asyncio.get_running_loop().create_future()
     pending_commands[cmd_id] = future
     
     try:
@@ -423,7 +423,7 @@ loop = None
 
 async def main():
     global loop
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     
     # Start WebSocket server
     ws_server = await ws_serve(ws_handler, "127.0.0.1", WS_PORT)

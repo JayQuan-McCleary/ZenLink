@@ -3,7 +3,7 @@
 
 (function() {
   'use strict';
-  const CONTENT_VERSION = 9;
+  const CONTENT_VERSION = 10;
   if (window.__claudeBridgeVersion >= CONTENT_VERSION) return;
   window.__claudeBridgeVersion = CONTENT_VERSION;
 
@@ -79,20 +79,30 @@
   }
 
   // ── Page Text ──
+  const PAGE_TEXT_LIMIT = 20000;
+
+  function truncateText(raw) {
+    const truncated = raw.length > PAGE_TEXT_LIMIT;
+    return {
+      text: truncated ? raw.slice(0, PAGE_TEXT_LIMIT) : raw,
+      ...(truncated && { truncated: true, fullLength: raw.length }),
+    };
+  }
+
   function getPageText(selector) {
     if (selector) {
       const el = document.querySelector(selector);
       if (!el) return { error: 'Selector not found: ' + selector };
-      return { text: el.innerText.slice(0, 20000) };
+      return truncateText(el.innerText);
     }
     const selectors = ['article', '[role="main"]', 'main', '.content', '.post-content', '.article-body', '.entry-content'];
     for (const sel of selectors) {
       const el = document.querySelector(sel);
       if (el && el.innerText.length > 100) {
-        return { text: el.innerText.slice(0, 20000) };
+        return truncateText(el.innerText);
       }
     }
-    return { text: document.body.innerText.slice(0, 20000) };
+    return truncateText(document.body.innerText);
   }
 
   // ── Accessibility Tree ──

@@ -43,9 +43,11 @@ function Zen-Forms {
     $r | ConvertTo-Json -Depth 5
 }
 
-function Zen-Navigate([string]$url) {
-    $body = @{ url = $url } | ConvertTo-Json
-    $r = Invoke-RestMethod "$BRIDGE_URL/api/navigate" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 10
+function Zen-Navigate([string]$url, [string]$expectTitle = "") {
+    $body = @{ url = $url }
+    if ($expectTitle) { $body.expectTitle = $expectTitle }
+    $json = $body | ConvertTo-Json
+    $r = Invoke-RestMethod "$BRIDGE_URL/api/navigate" -Method Post -Body $json -ContentType "application/json" -TimeoutSec 15
     $r | ConvertTo-Json
 }
 
@@ -65,7 +67,7 @@ function Zen-Type([string]$selector, [string]$text, [switch]$clear) {
     $r | ConvertTo-Json
 }
 
-function Zen-Scroll([string]$direction = "down", [int]$amount = 500) {
+function Zen-Scroll([string]$direction = "down", [int]$amount = 1) {
     $body = @{ direction = $direction; amount = $amount } | ConvertTo-Json
     $r = Invoke-RestMethod "$BRIDGE_URL/api/scroll" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5
     $r | ConvertTo-Json
@@ -101,9 +103,32 @@ function Zen-Highlight([string]$selector) {
     $r | ConvertTo-Json
 }
 
-Write-Host "Claude-Zen Bridge loaded. Functions available:" -ForegroundColor Cyan
+function Zen-WaitForElement([string]$selector, [int]$timeout = 10000) {
+    $body = @{ selector = $selector; timeout = $timeout } | ConvertTo-Json
+    $r = Invoke-RestMethod "$BRIDGE_URL/api/wait-for-element" -Method Post -Body $body -ContentType "application/json" -TimeoutSec ([math]::Ceiling($timeout / 1000) + 5)
+    $r | ConvertTo-Json
+}
+
+function Zen-WaitForResult([string]$code, [int]$timeout = 15000) {
+    $body = @{ code = $code; timeout = $timeout } | ConvertTo-Json
+    $r = Invoke-RestMethod "$BRIDGE_URL/api/wait-for-result" -Method Post -Body $body -ContentType "application/json" -TimeoutSec ([math]::Ceiling($timeout / 1000) + 5)
+    $r | ConvertTo-Json
+}
+
+function Zen-Batch([array]$commands, [switch]$stopOnWarning) {
+    $body = @{ commands = $commands }
+    if ($stopOnWarning.IsPresent) { $body.stopOnWarning = $true }
+    $json = $body | ConvertTo-Json -Depth 5
+    $r = Invoke-RestMethod "$BRIDGE_URL/api/batch" -Method Post -Body $json -ContentType "application/json" -TimeoutSec 300
+    $r | ConvertTo-Json -Depth 10
+}
+
+Write-Host "ZenLink Bridge loaded. Functions available:" -ForegroundColor Cyan
 Write-Host "  Zen-Status, Zen-Screenshot, Zen-PageInfo, Zen-PageText" -ForegroundColor Gray
 Write-Host "  Zen-Tabs, Zen-DOM, Zen-Forms" -ForegroundColor Gray
-Write-Host "  Zen-Navigate <url>, Zen-Click <selector>, Zen-Type <selector> <text>" -ForegroundColor Gray
-Write-Host "  Zen-Scroll <direction>, Zen-Hover <selector>, Zen-Fill <selector> <value>" -ForegroundColor Gray
+Write-Host "  Zen-Navigate <url> [-expectTitle <str>]" -ForegroundColor Gray
+Write-Host "  Zen-Click <selector>, Zen-Type <selector> <text>, Zen-Fill <selector> <value>" -ForegroundColor Gray
+Write-Host "  Zen-Scroll [direction] [amount], Zen-Hover <selector>" -ForegroundColor Gray
 Write-Host "  Zen-Find <query>, Zen-JS <code>, Zen-Highlight <selector>" -ForegroundColor Gray
+Write-Host "  Zen-WaitForElement <selector>, Zen-WaitForResult <code>" -ForegroundColor Gray
+Write-Host "  Zen-Batch <commands> [-stopOnWarning]" -ForegroundColor Gray
