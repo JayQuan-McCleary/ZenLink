@@ -168,6 +168,10 @@ async def run_command(cmd, _screenshot_dir='C:/Users/jayqu/claude-zen-screenshot
             timeout_ms = params.get('timeout', 10000)
             timeout_s = (timeout_ms / 1000) + 5
             return await send_to_extension('waitForElement', params, timeout=timeout_s)
+        elif action == 'waitForResult':
+            timeout_ms = params.get('timeout', 15000)
+            timeout_s = (timeout_ms / 1000) + 5
+            return await send_to_extension('waitForResult', params, timeout=timeout_s)
         elif action == 'sleep':
             import asyncio as _asyncio
             await _asyncio.sleep(params.get('ms', 1000) / 1000)
@@ -213,6 +217,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/api/switch-tab": self.handle_switch_tab,
             "/api/new-tab": self.handle_new_tab,
             "/api/wait-for-element": self.handle_wait_for_element,
+            "/api/wait-for-result": self.handle_wait_for_result,
             "/api/page-text-by-tab-id": self.handle_page_text_by_tab_id,
             "/api/batch": self.handle_batch,
         }
@@ -346,6 +351,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
         timeout_ms = body.get("timeout", 10000)
         timeout_s = (timeout_ms / 1000) + 5
         result = self.run_async(send_to_extension("waitForElement", body, timeout=timeout_s))
+        self.send_json(200, result)
+
+    def handle_wait_for_result(self):
+        body = self.read_body()
+        timeout_ms = body.get("timeout", 15000)
+        timeout_s = (timeout_ms / 1000) + 5
+        result = self.run_async(send_to_extension("waitForResult", body, timeout=timeout_s))
         self.send_json(200, result)
 
     def handle_page_text_by_tab_id(self):
@@ -513,6 +525,7 @@ async def main():
     print(f"  POST http://localhost:{HTTP_PORT}/api/js                  - Execute JavaScript")
     print(f"  POST http://localhost:{HTTP_PORT}/api/highlight           - Highlight element")
     print(f"  POST http://localhost:{HTTP_PORT}/api/wait-for-element    - Wait for element to appear")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/wait-for-result     - Poll JS expression until non-empty")
     print()
     
     # Keep running

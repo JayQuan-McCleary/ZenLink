@@ -24,7 +24,7 @@
 | Site | Main Challenge | Key Fix | Playbook |
 |------|---------------|---------|---------|
 | **Amazon** | Bot detection on JS injection | Navigate normally, scroll, read rendered DOM only | [amazon.md](./amazon.md) |
-| **Best Buy** | Intersection-observer lazy loading | `window.scrollTo(0, Npx)` via JS action + correct selector `.product-list-item` | [bestbuy.md](./bestbuy.md) |
+| **Best Buy** | Intersection-observer lazy loading | `scroll amount:1` + correct selector `.product-list-item` | [bestbuy.md](./bestbuy.md) |
 | **Newegg** | SubCategory URLs silently redirect | Use `/p/pl?d=keywords` search URL instead | [newegg.md](./newegg.md) |
 | **B&H Photo** | CSS Modules hashed class names | `[class*="product_"]` wildcard + innerText parsing | [bhphotovideo.md](./bhphotovideo.md) |
 
@@ -33,14 +33,14 @@
 ## Common Patterns (Quick Reference)
 
 ### Lazy-loading sites (Best Buy, B&H)
-Use JS pixel scrolling — ZenLink's native `scroll amount` maps to tiny pixel offsets,
-not enough to trigger intersection observers:
+Use `scroll` with `amount: 1` (one full viewport height) to trigger intersection
+observers. Repeat with sleeps between to let cards render:
 ```json
-{ "action": "js", "code": "window.scrollTo(0, 800)" },
+{ "action": "scroll", "direction": "down", "amount": 1 },
 { "action": "sleep", "ms": 1500 },
-{ "action": "js", "code": "window.scrollTo(0, 1600)" },
+{ "action": "scroll", "direction": "down", "amount": 1 },
 { "action": "sleep", "ms": 1500 },
-{ "action": "js", "code": "window.scrollTo(0, 2400)" },
+{ "action": "scroll", "direction": "down", "amount": 1 },
 { "action": "sleep", "ms": 2000 }
 ```
 
@@ -55,14 +55,15 @@ Then query: `document.querySelectorAll('[class*="product_"]')`
 - Use real browser navigation via `navigate` action only
 - Never use `fetch()` or XHR via the `js` action
 - Always scroll before extracting — let the page hydrate
-- Use `waitForElement` as your gate before any extraction JS
+- Use `waitForElement` or `waitForResult` as your gate before extraction JS
 
-### Silent redirect detection (Newegg)
-Always sanity-check `document.title` after navigation:
+### Silent redirect detection (Newegg and others)
+Use `expectTitle` on the `navigate` action:
 ```json
-{ "action": "js", "code": "document.title.substring(0, 80)" }
+{ "action": "navigate", "url": "https://...", "expectTitle": "gaming" }
 ```
-If the title doesn't match your expected category → you've been redirected.
+Returns `warning` and `redirected: true` if the page title doesn't contain
+the expected string. No need for manual `document.title` checks.
 
 ---
 

@@ -27,12 +27,13 @@ loaded. Amazon may also serve a bot-check interstitial if requests look automate
 ```
 Use `s=review-rank` for best-rated first. Use `rh=p_36%3A-200000` for under $2000.
 
-### Step 2 — Scroll to trigger hydration (use pixel values, not wheel amounts)
+### Step 2 — Scroll to trigger hydration
 ```json
-{ "action": "scroll", "direction": "down", "amount": 3 },
+{ "action": "scroll", "direction": "down", "amount": 1 },
 { "action": "waitForElement", "selector": "[data-component-type='s-search-result']", "timeout": 12000 },
-{ "action": "scroll", "direction": "down", "amount": 5 }
+{ "action": "scroll", "direction": "down", "amount": 1 }
 ```
+`amount: 1` = one full viewport height. Triggers hydration of lazy-loaded cards.
 
 ### Step 3 — Extract AFTER scrolling (products are now rendered)
 ```json

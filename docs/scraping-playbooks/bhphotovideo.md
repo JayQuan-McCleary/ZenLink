@@ -25,32 +25,12 @@ Times out — attribute no longer exists on product cards in 2026.
 ```
 Matches too broadly (nav items, wrappers, etc.) — not the product cards.
 
-## What WORKS — Runtime Class Sniffing
+## What WORKS — Wildcard Selector + innerText Parsing
 
-Since class name hashes change per deploy, **sniff the live class name at runtime**
-before extracting:
+The prefix before the underscore (`product_`) is stable across deploys even when
+the hash changes. Use `[class*="product_"]` as the selector.
 
-### Step 1 — Sniff for the product card class
-```json
-{
-  "action": "js",
-  "code": "JSON.stringify([...new Set([...document.querySelectorAll('[class]')].flatMap(e => [...e.classList]).filter(c => c.match(/^(item|product|card|result)_[a-zA-Z0-9]+$/)))].slice(0,10))"
-}
-```
-This finds all classes that follow the CSS Modules pattern: `word_hash`.
-Look for the one that matches your target (e.g. `product_UCJ1nUFwhh`).
-
-### Step 2 — Use `[class*="product_"]` wildcard selector
-Once you know the prefix, use a wildcard attribute selector — the prefix (`product_`)
-is stable even when the hash changes:
-```json
-{
-  "action": "js",
-  "code": "JSON.stringify([...document.querySelectorAll('[class*=\"product_\"]')].slice(0,10).map(el => ({ text: el.innerText?.substring(0, 300) })))"
-}
-```
-
-### Step 3 — Parse innerText (more reliable than child selectors)
+### Step 1 — Parse innerText (more reliable than child selectors)
 B&H product card innerText is structured and parseable. Use regex and string
 matching on `el.innerText` rather than child element selectors:
 ```js
@@ -64,13 +44,13 @@ const rating = el.innerText?.match(/(\d+) Reviews/)?.[1];
 
 ### Full extraction sequence
 ```json
-{ "action": "navigate", "url": "https://www.bhphotovideo.com/c/search?Ntt=gaming+desktop+pc&MaxPrice=2000&SortOrder=CustomerRankDsc" },
+{ "action": "navigate", "url": "https://www.bhphotovideo.com/c/search?Ntt=gaming+desktop+pc&MaxPrice=2000&SortOrder=CustomerRankDsc", "expectTitle": "gaming" },
 { "action": "sleep", "ms": 3000 },
-{ "action": "js", "code": "window.scrollTo(0, 800)" },
+{ "action": "scroll", "direction": "down", "amount": 1 },
 { "action": "sleep", "ms": 1500 },
-{ "action": "js", "code": "window.scrollTo(0, 1600)" },
+{ "action": "scroll", "direction": "down", "amount": 1 },
 { "action": "sleep", "ms": 1500 },
-{ "action": "js", "code": "window.scrollTo(0, 2400)" },
+{ "action": "scroll", "direction": "down", "amount": 1 },
 { "action": "sleep", "ms": 1500 },
 { "action": "js", "code": "JSON.stringify([...document.querySelectorAll('[class*=\"product_\"]')].slice(0,10).map(el => { const lines = el.innerText?.split('\\n').filter(l => l.trim()); const name = lines?.find(l => l.match(/desktop|gaming|tower|pc/i) && !l.match(/compare|cart|stock|reviews|Promo|GHz|DDR|SSD|RTX|More|Save|Free|Add/i)); const priceMatch = el.innerText?.match(/\\$(\\d[\\d,]+)\\s*\\n?\\s*(\\d{2})/); const price = priceMatch ? ('$' + priceMatch[1] + '.' + priceMatch[2]) : el.innerText?.match(/\\$[\\d,]+/)?.[0]; const rating = el.innerText?.match(/(\\d+) Reviews/)?.[1]; return name ? {name: name.trim(), price, rating: rating ? rating + ' reviews' : null} : null }).filter(Boolean))" }
 ```
@@ -94,3 +74,18 @@ const rating = el.innerText?.match(/(\d+) Reviews/)?.[1];
   for "best" queries.
 - Watch out for nav/filter `[class*="item_"]` elements — they look similar but
   their `innerText` will be short brand/category names, not product descriptions.
+
+---
+
+## Appendix: Debugging — Class Name Discovery
+
+If `[class*="product_"]` stops matching after a B&H deploy, sniff the live
+class names to find the new prefix:
+```json
+{
+  "action": "js",
+  "code": "JSON.stringify([...new Set([...document.querySelectorAll('[class]')].flatMap(e => [...e.classList]).filter(c => c.match(/^(item|product|card|result)_[a-zA-Z0-9]+$/)))].slice(0,10))"
+}
+```
+This returns all CSS Modules classes matching the `word_hash` pattern. Look for
+the one used on product card containers and update the wildcard selector above.

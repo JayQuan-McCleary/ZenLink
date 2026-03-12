@@ -3,7 +3,7 @@
 
 (function() {
   'use strict';
-  const CONTENT_VERSION = 7;
+  const CONTENT_VERSION = 8;
   if (window.__claudeBridgeVersion >= CONTENT_VERSION) return;
   window.__claudeBridgeVersion = CONTENT_VERSION;
 
@@ -29,6 +29,7 @@
       'highlight':             () => highlightElement(msg.selector),
       'clearHighlight':        () => clearHighlight(),
       'waitForElement':        () => waitForElement(msg.selector, msg.timeout, msg.pollInterval),
+      'waitForResult':         () => waitForResult(msg.code, msg.timeout, msg.pollInterval),
     };
 
     // Only respond if we're the latest version
@@ -275,7 +276,10 @@
   // ── Scroll ──
   function scrollPage(direction, amount, selector) {
     const target = selector ? resolveElement(selector) : null;
-    const dist = amount || 500;
+    // amount now means viewport-heights (1 = one full viewport, default = 1)
+    // This ensures lazy-loading intersection observers actually trigger
+    const viewportH = window.innerHeight;
+    const dist = Math.round((amount || 1) * viewportH);
     const opts = { behavior: 'smooth' };
 
     if (direction === 'top') {
@@ -287,7 +291,7 @@
       (target || window).scrollBy({ ...deltas[direction || 'down'], ...opts });
     }
 
-    return { ok: true, scrollY: window.scrollY, scrollX: window.scrollX };
+    return { ok: true, scrollY: window.scrollY, scrollX: window.scrollX, scrolledPx: dist };
   }
 
   // ── Hover ──
@@ -472,6 +476,46 @@
             selector,
             elapsed: Date.now() - start,
             error: `Timed out after ${maxWait}ms waiting for "${selector}"`,
+          });
+        } else {
+          setTimeout(poll, interval);
+        }
+      }
+      poll();
+    });
+  }
+
+  // ── Wait For Result (poll JS expression until non-empty) ──
+  function waitForResult(code, timeout, pollInterval) {
+    const maxWait = timeout || 15000;
+    const interval = pollInterval || 500;
+    const start = Date.now();
+
+    return new Promise((resolve) => {
+      function poll() {
+        try {
+          const raw = eval(code);
+          const result = String(raw ?? '');
+          // Treat non-empty, non-null, non-undefined, non-"[]", non-"null" as success
+          if (result && result !== 'undefined' && result !== 'null' && result !== '[]' && result !== '""') {
+            resolve({
+              ok: true,
+              result: result.slice(0, 5000),
+              elapsed: Date.now() - start,
+              polls: Math.floor((Date.now() - start) / interval) + 1,
+            });
+            return;
+          }
+        } catch (e) {
+          // Expression threw — keep polling (page may still be hydrating)
+        }
+
+        if (Date.now() - start >= maxWait) {
+          resolve({
+            ok: false,
+            result: null,
+            elapsed: Date.now() - start,
+            error: `Timed out after ${maxWait}ms — expression never returned non-empty result`,
           });
         } else {
           setTimeout(poll, interval);

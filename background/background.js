@@ -3,7 +3,7 @@
 
 'use strict';
 
-const EXPECTED_CONTENT_VERSION = 5;
+const EXPECTED_CONTENT_VERSION = 8;
 const WS_URL = 'ws://127.0.0.1:8766';
 let ws = null;
 let reconnectTimer = null;
@@ -161,7 +161,7 @@ async function handleCommand(command) {
     // Browser-level commands (handled here)
     case 'screenshot':   return await captureScreenshot();
     case 'getTabs':      return await getOpenTabs();
-    case 'navigate':     return await navigateTab(params.url, params.tabId);
+    case 'navigate':     return await navigateTab(params.url, params.tabId, params.expectTitle);
     case 'switchTab':    return await switchTab(params.tabId);
     case 'newTab':       return await createTab(params.url);
     case 'closeTab':     return await closeTab(params.tabId);
@@ -182,6 +182,7 @@ async function handleCommand(command) {
     case 'highlight':
     case 'clearHighlight':
     case 'waitForElement':
+    case 'waitForResult':
       return await forwardToContent(action, params);
     
     default:
@@ -222,7 +223,7 @@ async function getOpenTabs() {
   }
 }
 
-async function navigateTab(url, tabId) {
+async function navigateTab(url, tabId, expectTitle) {
   try {
     const targetTabId = tabId || (await getActiveTabId());
     if (!targetTabId) return { error: 'No active tab' };
@@ -245,7 +246,19 @@ async function navigateTab(url, tabId) {
       browser.tabs.onUpdated.addListener(listener);
     });
 
-    return { ok: true, url };
+    // Check if page title matches expectation (catches silent redirects)
+    const result = { ok: true, url };
+    if (expectTitle) {
+      const tab = await browser.tabs.get(targetTabId);
+      const title = tab.title || '';
+      const match = title.toLowerCase().includes(expectTitle.toLowerCase());
+      result.title = title;
+      if (!match) {
+        result.warning = `Title "${title}" does not contain expected "${expectTitle}" — possible redirect`;
+        result.redirected = true;
+      }
+    }
+    return result;
   } catch (e) {
     return { error: e.message };
   }
