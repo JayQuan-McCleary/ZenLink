@@ -62,13 +62,17 @@ async def ws_handler(websocket):
     
     try:
         async for message in websocket:
-            data = json.loads(message)
+            try:
+                data = json.loads(message)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                print(f"[{now()}] ⚠️ Bad message from extension: {e}")
+                continue
             cmd_id = data.get("id")
-            
+
             # Heartbeat ping - just ignore
             if data.get("type") == "ping":
                 continue
-            
+
             if cmd_id and cmd_id in pending_commands:
                 pending_commands[cmd_id].set_result(data.get("result", {}))
             else:
@@ -171,6 +175,12 @@ async def run_command(cmd):
             return {'ok': True}
         elif action == 'parallel':
             sequences = params.get('sequences', [])
+            # Validate: navigate/switchTab in parallel sequences must specify tabId
+            for i, seq in enumerate(sequences):
+                for cmd in seq:
+                    a = cmd.get('action', '')
+                    if a in ('navigate', 'switchTab') and 'tabId' not in cmd:
+                        return {'error': f'Sequence {i}: "{a}" inside parallel requires explicit tabId to avoid race conditions'}
             async def run_sequence(seq):
                 results = []
                 for c in seq:
@@ -214,6 +224,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/api/find": self.handle_find,
             "/api/js": self.handle_js,
             "/api/highlight": self.handle_highlight,
+            "/api/clear-highlight": self.handle_clear_highlight,
             "/api/close-tab": self.handle_close_tab,
             "/api/switch-tab": self.handle_switch_tab,
             "/api/new-tab": self.handle_new_tab,
@@ -331,6 +342,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
         result = self.run_async(send_to_extension("highlight", body))
         self.send_json(200, result)
 
+    def handle_clear_highlight(self):
+        result = self.run_async(send_to_extension("clearHighlight", {}))
+        self.send_json(200, result)
+
     def handle_close_tab(self):
         body = self.read_body()
         result = self.run_async(send_to_extension("closeTab", body))
@@ -394,7 +409,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         try:
             return json.loads(raw)
-        except:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"[{now()}] ⚠️ Bad request body: {e}")
             return {}
     
     def send_json(self, code, data):

@@ -3,7 +3,7 @@
 
 (function() {
   'use strict';
-  const CONTENT_VERSION = 10;
+  const CONTENT_VERSION = 11;
   if (window.__claudeBridgeVersion >= CONTENT_VERSION) return;
   window.__claudeBridgeVersion = CONTENT_VERSION;
 
@@ -377,26 +377,26 @@
 
   function fillViaPageContext(selector, value) {
     // Last resort: inject script into page context to pierce closed shadow DOM
+    // Uses JSON.stringify to safely embed user input and prevent template injection
     return new Promise((resolve) => {
       const script = document.createElement('script');
       const callbackName = '__claudeFill_' + Date.now();
-      script.textContent = `
-        (function() {
-          const el = document.querySelector('${selector.replace(/'/g, "\\'")}');
-          if (!el) { window['${callbackName}'] = 'not found'; return; }
-          const target = el.shadowRoot
-            ? (el.shadowRoot.querySelector('input,textarea,select') || el)
-            : (el.querySelector('input,textarea,select') || el);
-          target.focus();
-          const proto = target.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-          if (setter) setter.call(target, '${value.replace(/'/g, "\\'")}');
-          else target.value = '${value.replace(/'/g, "\\'")}';
-          target.dispatchEvent(new Event('input', {bubbles:true}));
-          target.dispatchEvent(new Event('change', {bubbles:true}));
-          window['${callbackName}'] = 'ok:' + target.tagName;
-        })();
-      `;
+      const safeSelector = JSON.stringify(selector);
+      const safeValue = JSON.stringify(String(value));
+      const safeCb = JSON.stringify(callbackName);
+      script.textContent = '(function(){' +
+        'var el=document.querySelector(' + safeSelector + ');' +
+        'if(!el){window[' + safeCb + ']="not found";return;}' +
+        'var target=el.shadowRoot?(el.shadowRoot.querySelector("input,textarea,select")||el):(el.querySelector("input,textarea,select")||el);' +
+        'target.focus();' +
+        'var proto=target.tagName==="TEXTAREA"?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;' +
+        'var setter=Object.getOwnPropertyDescriptor(proto,"value");' +
+        'if(setter&&setter.set)setter.set.call(target,' + safeValue + ');' +
+        'else target.value=' + safeValue + ';' +
+        'target.dispatchEvent(new Event("input",{bubbles:true}));' +
+        'target.dispatchEvent(new Event("change",{bubbles:true}));' +
+        'window[' + safeCb + ']="ok:"+target.tagName;' +
+      '})();';
       document.documentElement.appendChild(script);
       script.remove();
       const result = window.wrappedJSObject?.[callbackName] || window[callbackName] || 'unknown';

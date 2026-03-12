@@ -9,6 +9,8 @@ copy /Y background\background.js extension\background\background.js
 copy /Y content\content.js extension\content\content.js
 copy /Y native\bridge.py extension\native\bridge.py
 copy /Y native\zen-bridge.ps1 extension\native\zen-bridge.ps1
+copy /Y icons\icon-48.png extension\icons\icon-48.png
+copy /Y icons\icon-96.png extension\icons\icon-96.png
 
 echo.
 echo Done. extension/ is now in sync with root.

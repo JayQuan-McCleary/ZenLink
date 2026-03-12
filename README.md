@@ -124,6 +124,8 @@ curl http://localhost:8765/api/status
 | `/api/find` | `{"query": "login button"}` | Find elements by description |
 | `/api/js` | `{"code": "document.title"}` | Execute JavaScript (50KB result limit, returns `truncated: true` if exceeded) |
 | `/api/highlight` | `{"selector": "..."}` | Visual overlay on element |
+| `/api/clear-highlight` | _(none)_ | Remove all highlight overlays |
+| `/api/page-text-by-tab-id` | `{"tabId": 123}` | Extract text from a specific tab (not just active) |
 | `/api/wait-for-element` | `{"selector": "...", "timeout": 10000}` | Poll until element appears in DOM |
 | `/api/wait-for-result` | `{"code": "...", "timeout": 15000}` | Poll JS expression until it returns non-empty |
 | `/api/batch` | `{"commands": [...], "stopOnWarning": true}` | Run multiple commands (stops on warning/error if flag set) |
@@ -146,11 +148,28 @@ POST http://localhost:8765/api/batch
 }
 ```
 
-Available batch actions: `navigate`, `newTab`, `closeTab`, `switchTab`, `click`, `type`, `fill`, `scroll`, `hover`, `find`, `js`, `pageInfo`, `pageText`, `screenshot`, `tabs`, `forms`, `dom`, `highlight`, `waitForElement`, `waitForResult`, `sleep`
+Available batch actions: `navigate`, `newTab`, `closeTab`, `switchTab`, `click`, `type`, `fill`, `scroll`, `hover`, `find`, `js`, `pageInfo`, `pageText`, `pageTextByTabId`, `screenshot`, `tabs`, `forms`, `dom`, `highlight`, `waitForElement`, `waitForResult`, `sleep`, `parallel`
 
 **`stopOnWarning`**: Set to `true` to halt batch execution if any command returns a `warning` (e.g. `expectTitle` redirect mismatch) or `error`. The halting result will include `_stopped: true`.
 
 **`expectTitle`** on navigate: Pass `"expectTitle": "keyword"` to check the loaded page title. If the title doesn't contain the keyword (case-insensitive), the result includes `warning` and `redirected: true` — useful for catching silent URL redirects.
+
+**`parallel`**: Run multiple command sequences concurrently. Each sequence runs its commands in order, but all sequences execute at the same time. Commands that target the active tab (like `navigate`) **must** include an explicit `tabId` to avoid race conditions.
+
+```json
+{
+  "action": "parallel",
+  "sequences": [
+    [
+      {"action": "pageText", "tabId": 1},
+      {"action": "screenshot"}
+    ],
+    [
+      {"action": "forms", "tabId": 2}
+    ]
+  ]
+}
+```
 
 ### Element Targeting
 
