@@ -75,7 +75,7 @@ const rating = el.innerText?.match(/(\d+) Reviews/)?.[1];
 { "action": "js", "code": "JSON.stringify([...document.querySelectorAll('[class*=\"product_\"]')].slice(0,10).map(el => { const lines = el.innerText?.split('\\n').filter(l => l.trim()); const name = lines?.find(l => l.match(/desktop|gaming|tower|pc/i) && !l.match(/compare|cart|stock|reviews|Promo|GHz|DDR|SSD|RTX|More|Save|Free|Add/i)); const priceMatch = el.innerText?.match(/\\$(\\d[\\d,]+)\\s*\\n?\\s*(\\d{2})/); const price = priceMatch ? ('$' + priceMatch[1] + '.' + priceMatch[2]) : el.innerText?.match(/\\$[\\d,]+/)?.[0]; const rating = el.innerText?.match(/(\\d+) Reviews/)?.[1]; return name ? {name: name.trim(), price, rating: rating ? rating + ' reviews' : null} : null }).filter(Boolean))" }
 ```
 
-## Key Selectors (verified March 2026)
+## Key Selectors (verified 2026-03-12)
 | Data | Selector / Method |
 |------|----------|
 | Product card container | `[class*="product_"]` (wildcard prefix) |

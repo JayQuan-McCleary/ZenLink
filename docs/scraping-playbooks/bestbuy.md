@@ -57,7 +57,7 @@ the intersection observer time to fire and render the newly visible cards.
 }
 ```
 
-## Key Selectors (verified March 2026)
+## Key Selectors (verified 2026-03-12)
 | Data | Selector |
 |------|----------|
 | Product card container | `.product-list-item` |

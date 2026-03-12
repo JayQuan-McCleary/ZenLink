@@ -51,7 +51,7 @@ https://www.newegg.com/p/pl?d=gaming+desktop+rtx&Order=RATING&Price=-200000
 }
 ```
 
-## Key Selectors (verified March 2026)
+## Key Selectors (verified 2026-03-12)
 | Data | Selector |
 |------|----------|
 | Product card container | `.item-cell` |

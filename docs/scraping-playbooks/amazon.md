@@ -42,7 +42,7 @@ Use `s=review-rank` for best-rated first. Use `rh=p_36%3A-200000` for under $200
 }
 ```
 
-## Key Selectors (verified March 2026)
+## Key Selectors (verified 2026-03-12)
 | Data | Selector |
 |------|----------|
 | Product card container | `[data-component-type="s-search-result"]` |

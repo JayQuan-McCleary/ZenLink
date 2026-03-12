@@ -9,7 +9,7 @@ Usage: python bridge.py
 AI AGENT NOTICE -- READ BEFORE WRITING SCRAPING BATCH SEQUENCES
 ------------------------------------------------------------------------
 Before writing any batch commands that scrape a known website, check:
-    D:\ZenLink\docs\scraping-playbooks\README.md
+    docs/scraping-playbooks/README.md   (relative to repo root)
 Playbooks exist for sites that required non-obvious workarounds:
   * amazon.md       -- bot detection / scroll-before-extract pattern
   * bestbuy.md      -- lazy loading / window.scrollTo fix / 2026 selectors

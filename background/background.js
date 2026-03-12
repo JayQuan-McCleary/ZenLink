@@ -235,8 +235,8 @@ async function navigateTab(url, tabId) {
         resolve();
       }, 15000);
 
-      function listener(updatedTabId, changeInfo) {
-        if (updatedTabId === targetTabId && changeInfo.status === 'complete') {
+      function listener(updatedTabId, changeInfo, tab) {
+        if (updatedTabId === targetTabId && changeInfo.status === 'complete' && tab.url && !tab.url.startsWith('about:')) {
           clearTimeout(timeout);
           browser.tabs.onUpdated.removeListener(listener);
           resolve();
