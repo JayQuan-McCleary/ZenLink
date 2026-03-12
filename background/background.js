@@ -143,6 +143,7 @@ async function injectAllTabs() {
 
 function isRestrictedUrl(url) {
   if (!url) return true;
+  if (url === 'about:blank') return false;  // blank tabs may have loaded content - let sendMessage decide
   return url.startsWith('about:') ||
          url.startsWith('moz-extension:') ||
          url.startsWith('chrome:') ||
@@ -164,6 +165,7 @@ async function handleCommand(command) {
     case 'switchTab':    return await switchTab(params.tabId);
     case 'newTab':       return await createTab(params.url);
     case 'closeTab':     return await closeTab(params.tabId);
+    case 'getPageTextFromTab': return await forwardToContent('getPageText', params);
     
     // Content script commands (forwarded to active tab)
     case 'getPageInfo':
@@ -179,6 +181,7 @@ async function handleCommand(command) {
     case 'executeJS':
     case 'highlight':
     case 'clearHighlight':
+    case 'waitForElement':
       return await forwardToContent(action, params);
     
     default:
@@ -224,6 +227,24 @@ async function navigateTab(url, tabId) {
     const targetTabId = tabId || (await getActiveTabId());
     if (!targetTabId) return { error: 'No active tab' };
     await browser.tabs.update(targetTabId, { url });
+
+    // Wait for page to finish loading before returning
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        browser.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }, 15000);
+
+      function listener(updatedTabId, changeInfo) {
+        if (updatedTabId === targetTabId && changeInfo.status === 'complete') {
+          clearTimeout(timeout);
+          browser.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      }
+      browser.tabs.onUpdated.addListener(listener);
+    });
+
     return { ok: true, url };
   } catch (e) {
     return { error: e.message };

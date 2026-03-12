@@ -3,7 +3,7 @@
 
 (function() {
   'use strict';
-  const CONTENT_VERSION = 5;
+  const CONTENT_VERSION = 7;
   if (window.__claudeBridgeVersion >= CONTENT_VERSION) return;
   window.__claudeBridgeVersion = CONTENT_VERSION;
 
@@ -16,7 +16,7 @@
     const handlers = {
       'ping':                  () => ({ ok: true, version: CONTENT_VERSION }),
       'getPageInfo':           () => getPageInfo(),
-      'getPageText':           () => getPageText(),
+      'getPageText':           () => getPageText(msg.selector),
       'getAccessibilityTree':  () => getAccessibilityTree(msg.depth || 6),
       'getFormFields':         () => getFormFields(),
       'click':                 () => clickElement(msg.selector, msg.coords),
@@ -28,6 +28,7 @@
       'executeJS':             () => executeJS(msg.code),
       'highlight':             () => highlightElement(msg.selector),
       'clearHighlight':        () => clearHighlight(),
+      'waitForElement':        () => waitForElement(msg.selector, msg.timeout, msg.pollInterval),
     };
 
     // Only respond if we're the latest version
@@ -38,7 +39,7 @@
     try {
       const result = handler();
       if (result && typeof result.then === 'function') {
-        // Async handler � keep message channel open
+        // Async handler — keep message channel open
         result.then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
         return true;
       }
@@ -68,7 +69,12 @@
   }
 
   // ── Page Text ──
-  function getPageText() {
+  function getPageText(selector) {
+    if (selector) {
+      const el = document.querySelector(selector);
+      if (!el) return { error: 'Selector not found: ' + selector };
+      return { text: el.innerText.slice(0, 20000) };
+    }
     const selectors = ['article', '[role="main"]', 'main', '.content', '.post-content', '.article-body', '.entry-content'];
     for (const sel of selectors) {
       const el = document.querySelector(sel);
@@ -305,7 +311,7 @@
     let result;
     try { result = fillField(selector, value); } catch(e) { result = { error: e.message }; }
     if (result.error && (result.error.includes('HTMLInputElement') || result.error.includes('HTMLTextAreaElement'))) {
-      // Shadow DOM not accessible from content script � use page context
+      // Shadow DOM not accessible from content script — use page context
       const pageResult = await fillViaPageContext(selector, value);
       if (pageResult.startsWith('ok:')) {
         return { ok: true, pierced: true, method: 'pageContext', tag: pageResult.split(':')[1].toLowerCase() };
@@ -387,7 +393,7 @@
     const child = el.querySelector('input, textarea, select');
     if (child) return child;
 
-    // Closed shadow root � try page context access via wrappedJSObject (Firefox)
+    // Closed shadow root — try page context access via wrappedJSObject (Firefox)
     try {
       const unwrapped = el.wrappedJSObject || el;
       if (unwrapped.shadowRoot) {
@@ -435,6 +441,44 @@
     } catch (e) {
       return { error: e.message };
     }
+  }
+
+  // ── Wait For Element ──
+  function waitForElement(selector, timeout, pollInterval) {
+    const maxWait = timeout || 10000;
+    const interval = pollInterval || 200;
+    const start = Date.now();
+
+    return new Promise((resolve) => {
+      function poll() {
+        const el = document.querySelector(selector);
+        if (el && !isHidden(el)) {
+          const elapsed = Date.now() - start;
+          const ref = `r${refCounter++}`;
+          refMap[ref] = el;
+          resolve({
+            ok: true,
+            found: true,
+            selector,
+            elapsed,
+            ref,
+            tag: el.tagName.toLowerCase(),
+            text: (el.textContent || '').trim().slice(0, 120),
+          });
+        } else if (Date.now() - start >= maxWait) {
+          resolve({
+            ok: false,
+            found: false,
+            selector,
+            elapsed: Date.now() - start,
+            error: `Timed out after ${maxWait}ms waiting for "${selector}"`,
+          });
+        } else {
+          setTimeout(poll, interval);
+        }
+      }
+      poll();
+    });
   }
 
   // ── Highlight ──
