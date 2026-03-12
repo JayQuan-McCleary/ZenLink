@@ -14,4 +14,7 @@ copy /Y icons\icon-96.png extension\icons\icon-96.png
 
 echo.
 echo Done. extension/ is now in sync with root.
-echo Remember to rebuild the .xpi if publishing to AMO.
+echo.
+echo !! The .xpi in web-ext-artifacts/ is NOT rebuilt automatically.
+echo !! To rebuild: cd extension ^&^& npx web-ext build
+echo !! Do NOT publish to AMO from a stale .xpi.

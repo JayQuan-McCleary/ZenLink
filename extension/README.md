@@ -65,12 +65,16 @@ Claude Desktop calls these via `Invoke-RestMethod` or `curl`:
 | POST | `/api/navigate` | `{"url": "..."}` |
 | POST | `/api/click` | `{"selector": "..."}` or `{"coords": {"x":0,"y":0}}` |
 | POST | `/api/type` | `{"selector": "...", "text": "...", "clear": true}` |
-| POST | `/api/scroll` | `{"direction": "down", "amount": 500}` |
+| POST | `/api/scroll` | `{"direction": "down", "amount": 1}` (amount = viewport heights) |
 | POST | `/api/hover` | `{"selector": "..."}` |
 | POST | `/api/fill` | `{"selector": "...", "value": "..."}` |
 | POST | `/api/find` | `{"query": "search button"}` |
-| POST | `/api/js` | `{"code": "document.title"}` |
+| POST | `/api/js` | `{"code": "document.title"}` (50KB limit, returns `truncated: true` if exceeded) |
 | POST | `/api/highlight` | `{"selector": "..."}` |
+| POST | `/api/clear-highlight` | Remove all highlight overlays |
+| POST | `/api/wait-for-element` | `{"selector": "...", "timeout": 10000}` |
+| POST | `/api/wait-for-result` | `{"code": "...", "timeout": 15000}` |
+| POST | `/api/batch` | `{"commands": [...], "stopOnWarning": true}` |
 
 ## How Claude Desktop Uses It
 
