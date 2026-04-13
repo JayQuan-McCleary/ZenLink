@@ -41,14 +41,64 @@ except ImportError:
     from websockets.server import serve as ws_serve
 
 # ── Config ──
+BRIDGE_VERSION = "1.1.2"
+API_VERSION = "1"
 HTTP_PORT = 8765
 WS_PORT = 8766
 SCREENSHOT_DIR = os.path.join(os.path.expanduser("~"), "claude-zen-screenshots")
+WORKFLOW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
 
 # ── State ──
 extension_ws = None  # WebSocket connection to extension
 pending_commands = {}  # id -> asyncio.Future
 command_counter = 0
+
+# ── Cache ──
+import re as _re
+_cache = {}  # key -> (timestamp, data)
+CACHE_TTL = 5  # seconds
+
+def _cache_key(action, params):
+    return action + ":" + json.dumps(params, sort_keys=True)
+
+def _cache_get(key):
+    entry = _cache.get(key)
+    if entry and (time.time() - entry[0]) < CACHE_TTL:
+        return entry[1]
+    if entry:
+        del _cache[key]
+    return None
+
+def _cache_set(key, data):
+    _cache[key] = (time.time(), data)
+    if len(_cache) > 100:
+        cutoff = time.time() - CACHE_TTL
+        for k in [k for k, (t, _) in _cache.items() if t < cutoff]:
+            del _cache[k]
+
+
+def _parse_workflow(filepath, variables=None):
+    """Parse a workflow .md file into a list of batch commands."""
+    variables = variables or {}
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    blocks = _re.findall(r'```json\s*\n(.*?)\n```', content, _re.DOTALL)
+
+    commands = []
+    for block in blocks:
+        text = block
+        for key, val in variables.items():
+            text = text.replace('{{' + key + '}}', str(val))
+        try:
+            cmd = json.loads(text)
+            commands.append(cmd)
+        except json.JSONDecodeError as e:
+            return None, f"Invalid JSON in workflow block: {e}"
+
+    if not commands:
+        return None, "No JSON command blocks found in workflow"
+    return commands, None
 
 
 # ══════════════════════════════════════════════
@@ -57,9 +107,11 @@ command_counter = 0
 
 async def ws_handler(websocket):
     global extension_ws
+    if extension_ws is not None:
+        print(f"[{now()}] ↻ New extension connection replacing existing one")
     extension_ws = websocket
     print(f"[{now()}] ✅ Zen Browser extension connected")
-    
+
     try:
         async for message in websocket:
             try:
@@ -81,6 +133,11 @@ async def ws_handler(websocket):
         print(f"[{now()}] ⚠️ Extension disconnected")
     finally:
         extension_ws = None
+        # Fail all pending commands immediately instead of letting them timeout
+        for cmd_id, future in list(pending_commands.items()):
+            if not future.done():
+                future.set_result({"error": "Extension disconnected"})
+        pending_commands.clear()
 
 
 async def send_to_extension(action, params=None, timeout=30):
@@ -108,6 +165,8 @@ async def send_to_extension(action, params=None, timeout=30):
         return result
     except asyncio.TimeoutError:
         return {"error": f"Command timed out after {timeout}s"}
+    except websockets.exceptions.ConnectionClosed:
+        return {"error": "Extension disconnected while waiting for response"}
     except Exception as e:
         return {"error": str(e)}
     finally:
@@ -147,6 +206,10 @@ async def run_command(cmd):
     action = cmd.get('action', '')
     params = {k: v for k, v in cmd.items() if k != 'action'}
     try:
+        # Normalize find params: extension expects "query", users may send "selector"
+        if action == 'find' and 'query' not in params and 'selector' in params:
+            params['query'] = params.pop('selector')
+
         # Simple forwarding actions (the majority)
         if action in BATCH_ACTION_MAP:
             return await send_to_extension(BATCH_ACTION_MAP[action], params)
@@ -205,6 +268,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/api/tabs": self.handle_tabs,
             "/api/dom": self.handle_dom,
             "/api/forms": self.handle_forms,
+            "/api/version": self.handle_version,
+            "/api/workflows": self.handle_list_workflows,
         }
         
         handler = routes.get(self.path.split("?")[0])
@@ -232,6 +297,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/api/wait-for-result": self.handle_wait_for_result,
             "/api/page-text-by-tab-id": self.handle_page_text_by_tab_id,
             "/api/batch": self.handle_batch,
+            "/api/cache": self.handle_cache,
+            "/api/workflow": self.handle_workflow,
         }
         
         handler = routes.get(self.path)
@@ -276,15 +343,36 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_json(200, result)
     
     def handle_page_info(self):
+        key = _cache_key("getPageInfo", {})
+        cached = _cache_get(key)
+        if cached:
+            self.send_json(200, {**cached, "_cached": True})
+            return
         result = self.run_async(send_to_extension("getPageInfo"))
+        if "error" not in result:
+            _cache_set(key, result)
         self.send_json(200, result)
-    
+
     def handle_page_text(self):
+        key = _cache_key("getPageText", {})
+        cached = _cache_get(key)
+        if cached:
+            self.send_json(200, {**cached, "_cached": True})
+            return
         result = self.run_async(send_to_extension("getPageText"))
+        if "error" not in result:
+            _cache_set(key, result)
         self.send_json(200, result)
-    
+
     def handle_tabs(self):
+        key = _cache_key("getTabs", {})
+        cached = _cache_get(key)
+        if cached:
+            self.send_json(200, {**cached, "_cached": True})
+            return
         result = self.run_async(send_to_extension("getTabs"))
+        if "error" not in result:
+            _cache_set(key, result)
         self.send_json(200, result)
     
     def handle_dom(self):
@@ -294,7 +382,29 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def handle_forms(self):
         result = self.run_async(send_to_extension("getFormFields"))
         self.send_json(200, result)
-    
+
+    def handle_version(self):
+        info = {
+            "bridge": BRIDGE_VERSION,
+            "api": API_VERSION,
+            "extension_connected": extension_ws is not None,
+        }
+        if extension_ws:
+            try:
+                result = self.run_async(send_to_extension("ping"), timeout=5)
+                info["extension"] = result.get("version", "unknown")
+            except Exception:
+                info["extension"] = "unreachable"
+        else:
+            info["extension"] = "not connected"
+        self.send_json(200, info)
+
+    def handle_list_workflows(self):
+        available = []
+        if os.path.isdir(WORKFLOW_DIR):
+            available = [f[:-3] for f in os.listdir(WORKFLOW_DIR) if f.endswith('.md')]
+        self.send_json(200, {"workflows": available, "directory": WORKFLOW_DIR})
+
     # ── POST Handlers ──
     
     def handle_click(self):
@@ -329,6 +439,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
     
     def handle_find(self):
         body = self.read_body()
+        # Extension expects "query", users may send "selector"
+        if 'query' not in body and 'selector' in body:
+            body['query'] = body.pop('selector')
         result = self.run_async(send_to_extension("find", body))
         self.send_json(200, result)
     
@@ -399,6 +512,58 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         results = self.run_async(run_all(), timeout=300)
         self.send_json(200, {'results': results})
+
+    def handle_cache(self):
+        global CACHE_TTL
+        body = self.read_body()
+        action = body.get("action", "clear")
+        if action == "clear":
+            _cache.clear()
+            self.send_json(200, {"ok": True, "cleared": True})
+        elif action == "status":
+            self.send_json(200, {"entries": len(_cache), "ttl": CACHE_TTL})
+        elif action == "ttl":
+            CACHE_TTL = body.get("seconds", 5)
+            self.send_json(200, {"ok": True, "ttl": CACHE_TTL})
+        else:
+            self.send_json(400, {"error": f"Unknown cache action: {action}"})
+
+    def handle_workflow(self):
+        body = self.read_body()
+        name = body.get("name", "")
+        variables = body.get("variables", {})
+
+        if not name:
+            self.send_json(400, {"error": "Missing 'name' parameter"})
+            return
+
+        # Sanitize filename
+        safe_name = _re.sub(r'[^\w\-]', '', name)
+        filepath = os.path.join(WORKFLOW_DIR, f"{safe_name}.md")
+
+        if not os.path.isfile(filepath):
+            available = []
+            if os.path.isdir(WORKFLOW_DIR):
+                available = [f[:-3] for f in os.listdir(WORKFLOW_DIR) if f.endswith('.md')]
+            self.send_json(404, {"error": f"Workflow '{name}' not found", "available": available})
+            return
+
+        commands, err = _parse_workflow(filepath, variables)
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        async def run_workflow():
+            results = []
+            for cmd in commands:
+                r = await run_command(cmd)
+                results.append(r)
+                if isinstance(r, dict) and r.get('error'):
+                    break
+            return results
+
+        results = self.run_async(run_workflow(), timeout=300)
+        self.send_json(200, {"workflow": name, "steps": len(commands), "results": results})
 
     # ── Helpers ──
     
@@ -483,6 +648,10 @@ async def main():
     print(f"  POST http://localhost:{HTTP_PORT}/api/highlight           - Highlight element")
     print(f"  POST http://localhost:{HTTP_PORT}/api/wait-for-element    - Wait for element to appear")
     print(f"  POST http://localhost:{HTTP_PORT}/api/wait-for-result     - Poll JS expression until non-empty")
+    print(f"  GET  http://localhost:{HTTP_PORT}/api/version             - Bridge/extension version info")
+    print(f"  GET  http://localhost:{HTTP_PORT}/api/workflows           - List available workflows")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/workflow            - Execute a named workflow")
+    print(f"  POST http://localhost:{HTTP_PORT}/api/cache               - Cache control (clear/status/ttl)")
     print()
     
     # Keep running

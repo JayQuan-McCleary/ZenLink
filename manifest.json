@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
-  "name": "Claude Bridge for Zen",
-  "version": "1.1.0",
+  "name": "ZenLink",
+  "version": "1.1.2",
   "description": "Lets Claude Desktop control Zen Browser via local bridge server",
   "icons": {
     "48": "icons/icon-48.png",

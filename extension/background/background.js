@@ -158,6 +158,9 @@ async function handleCommand(command) {
   const { action, id, ...params } = command;
   
   switch (action) {
+    // Bridge-level commands
+    case 'ping':         return { ok: true, version: EXPECTED_CONTENT_VERSION };
+
     // Browser-level commands (handled here)
     case 'screenshot':   return await captureScreenshot();
     case 'getTabs':      return await getOpenTabs();

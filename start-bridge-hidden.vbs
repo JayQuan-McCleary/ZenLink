@@ -1,10 +1,7 @@
 Set WshShell = CreateObject("WScript.Shell")
 
-' Start bridge hidden
-' Resolve bridge.py relative to this script's location
-Dim scriptDir
-scriptDir = Left(WScript.ScriptFullName, InStrRev(WScript.ScriptFullName, "\"))
-WshShell.Run "pythonw """ & scriptDir & "native\bridge.py""", 0, False
+' Start bridge hidden using compiled exe (no Python required)
+WshShell.Run """D:\ZenLink\native\dist\zenlink-bridge.exe""", 0, False
 
 ' Wait for bridge to start
 WScript.Sleep 2000
