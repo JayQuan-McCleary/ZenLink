@@ -15,6 +15,10 @@ native/dist/
 
 # Local agent config
 .claude/
+CLAUDE.md
 
 # Inno Setup build output
 installer/output/
+
+# Per-release notes extracted from CHANGELOG (regenerated each cut)
+release-notes-*.md
