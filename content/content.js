@@ -3,7 +3,7 @@
 
 (function() {
   'use strict';
-  const CONTENT_VERSION = 11;
+  const CONTENT_VERSION = 14;
   if (window.__claudeBridgeVersion >= CONTENT_VERSION) return;
   window.__claudeBridgeVersion = CONTENT_VERSION;
 
@@ -30,6 +30,7 @@
       'getFormFields':         () => getFormFields(),
       'click':                 () => clickElement(msg.selector, msg.coords),
       'type':                  () => typeText(msg.selector, msg.text, msg.clear),
+      'setEditableContent':    () => setEditableContent(msg.selector, msg.value, msg.format || 'text', msg.clear !== false),
       'scroll':                () => scrollPage(msg.direction, msg.amount, msg.selector),
       'hover':                 () => hoverElement(msg.selector, msg.coords),
       'fill':                  () => fillFieldSafe(msg.selector, msg.value),
@@ -39,6 +40,36 @@
       'clearHighlight':        () => clearHighlight(),
       'waitForElement':        () => waitForElement(msg.selector, msg.timeout, msg.pollInterval),
       'waitForResult':         () => waitForResult(msg.code, msg.timeout, msg.pollInterval),
+      // ── 1.4.0 additions ──
+      'query':                 () => queryElements(msg.selector, msg.fields, msg.limit),
+      'getHTML':               () => getHTML(msg.selector),
+      'getLinks':              () => getLinks(msg.internalOnly),
+      'getImages':             () => getImages(),
+      'getMeta':               () => getMeta(),
+      'getStructuredData':     () => getStructuredData(),
+      'getBounds':             () => getBounds(msg.selector),
+      'getComputedStyle':      () => getComputedStyleFor(msg.selector, msg.properties),
+      'getReadability':        () => getReadability(),
+      'getMarkdown':           () => getMarkdown(msg.selector),
+      'selectOption':          () => selectOption(msg.selector, msg.value, msg.byText),
+      'checkBox':              () => checkBox(msg.selector, msg.checked),
+      'focusElement':          () => focusEl(msg.selector),
+      'blurElement':           () => blurEl(msg.selector),
+      'keypress':              () => keypress(msg.selector, msg.key, msg.modifiers, msg.text),
+      'doubleClick':           () => doubleClick(msg.selector),
+      'submitForm':            () => submitForm(msg.selector),
+      'formFill':              () => formFill(msg.fields),
+      'drag':                  () => dragElement(msg.from, msg.to),
+      'waitForUrl':            () => waitForUrl(msg.pattern, msg.timeout),
+      'waitForTitle':          () => waitForTitle(msg.pattern, msg.timeout),
+      'waitForNetworkIdle':    () => waitForNetworkIdle(msg.idleMs, msg.timeout),
+      'captureNetwork':        () => captureNetwork(msg.op, msg.since),
+      'watchConsole':          () => watchConsole(msg.enabled),
+      'consoleLogs':           () => consoleLogs(msg.since, msg.level),
+      'storageOp':             () => storageOp(msg.kind, msg.op, msg.key, msg.value),
+      'getIframes':            () => getIframes(),
+      'explainSelector':       () => explainSelector(msg.selector),
+      'fullPageMetrics':       () => fullPageMetrics(),
     };
 
     // Only respond if we're the latest version
@@ -231,26 +262,42 @@
 
   // ── Click ──
   function clickElement(selector, coords) {
-    const el = resolveElement(selector, coords);
+    let el = resolveElement(selector, coords);
     if (!el) return { error: 'Element not found' };
 
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    
-    // Small delay for scroll, then click
-    const rect = el.getBoundingClientRect();
-    const x = rect.x + rect.width / 2;
-    const y = rect.y + rect.height / 2;
+    if (coords) {
+      el = nearestInteractiveAncestor(el) || el;
+    } else {
+      el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
+    }
 
-    // Full mouse event sequence
-    for (const type of ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click']) {
-      el.dispatchEvent(new MouseEvent(type, {
-        bubbles: true, cancelable: true, view: window,
-        clientX: x, clientY: y
+    const rect = el.getBoundingClientRect();
+    const x = coords ? coords.x : rect.x + rect.width / 2;
+    const y = coords ? coords.y : rect.y + rect.height / 2;
+    const eventInit = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      button: 0,
+      buttons: 1,
+    };
+
+    for (const type of ['pointerover', 'pointerenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      const EventCtor = type.startsWith('pointer') && window.PointerEvent ? PointerEvent : MouseEvent;
+      el.dispatchEvent(new EventCtor(type, {
+        ...eventInit,
+        pointerId: 1,
+        pointerType: 'mouse',
+        isPrimary: true,
       }));
     }
 
-    // Also try .click() for stubborn elements
-    if (typeof el.click === 'function') el.click();
+    if (typeof el.click === 'function') {
+      el.click();
+    }
 
     return { ok: true, tag: el.tagName.toLowerCase(), text: (el.textContent || '').trim().slice(0, 60) };
   }
@@ -292,6 +339,55 @@
     el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
 
     return { ok: true };
+  }
+
+  // ── Set Editable Content ──
+  function setEditableContent(selector, value, format, clear) {
+    const el = resolveElement(selector);
+    if (!el) return { error: 'Element not found' };
+
+    const target = getEditableTarget(el);
+    if (!target) return { error: 'Element is not editable' };
+
+    target.focus();
+    const text = String(value ?? '');
+
+    if (target.isContentEditable || target.contentEditable === 'true') {
+      if (clear) {
+        if (format === 'html') {
+          target.innerHTML = text;
+        } else {
+          target.innerText = text;
+        }
+      } else {
+        document.execCommand(format === 'html' ? 'insertHTML' : 'insertText', false, text);
+      }
+      target.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        inputType: clear ? 'insertReplacementText' : 'insertText',
+        data: format === 'text' ? text : null,
+      }));
+      target.dispatchEvent(new Event('change', { bubbles: true }));
+      return {
+        ok: true,
+        tag: target.tagName.toLowerCase(),
+        contentEditable: true,
+        length: text.length,
+      };
+    }
+
+    if (['INPUT', 'TEXTAREA'].includes(target.tagName)) {
+      const proto = target.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      const next = clear ? text : `${target.value || ''}${text}`;
+      if (setter) setter.call(target, next);
+      else target.value = next;
+      target.dispatchEvent(new Event('input', { bubbles: true }));
+      target.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, tag: target.tagName.toLowerCase(), length: text.length };
+    }
+
+    return { error: 'Element is not editable' };
   }
 
   // ── Scroll ──
@@ -428,6 +524,29 @@
     } catch {}
 
     return el;
+  }
+
+  function getEditableTarget(el) {
+    if (el.isContentEditable || el.contentEditable === 'true') return el;
+    if (['INPUT', 'TEXTAREA'].includes(el.tagName)) return el;
+
+    if (el.shadowRoot) {
+      const inner = el.shadowRoot.querySelector('[contenteditable="true"], textarea, input');
+      if (inner) return inner;
+    }
+
+    const child = el.querySelector?.('[contenteditable="true"], textarea, input');
+    if (child) return child;
+
+    try {
+      const unwrapped = el.wrappedJSObject || el;
+      if (unwrapped.shadowRoot) {
+        const inner = unwrapped.shadowRoot.querySelector('[contenteditable="true"], textarea, input');
+        if (inner) return XPCNativeWrapper(inner);
+      }
+    } catch {}
+
+    return null;
   }
 
   // ── Get Form Fields ──
@@ -596,6 +715,15 @@
     return null;
   }
 
+  function nearestInteractiveAncestor(el) {
+    let cur = el;
+    while (cur && cur !== document.body) {
+      if (isInteractiveElement(cur)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
   function isHidden(el) {
     if (!el || el.hidden) return true;
     const s = window.getComputedStyle(el);
@@ -648,6 +776,710 @@
     }
     const parent = el.closest('label');
     return parent ? parent.textContent.trim().slice(0, 80) : (el.ariaLabel || '');
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  // 1.4.0 additions
+  // ══════════════════════════════════════════════════════════════
+
+  // ── Multi-field extract ──
+  const DEFAULT_FIELDS = ['text', 'href', 'value', 'src', 'alt', 'id', 'name'];
+  const QUERY_LIMIT = 500;
+
+  function queryElements(selector, fields, limit) {
+    if (!selector) return { error: 'queryElements requires selector' };
+    let nodes;
+    try { nodes = document.querySelectorAll(selector); } catch (e) { return { error: 'Invalid selector: ' + e.message }; }
+    const cap = Math.min(limit || QUERY_LIMIT, QUERY_LIMIT);
+    const want = (fields && fields.length) ? fields : DEFAULT_FIELDS;
+    const items = [];
+    for (let i = 0; i < nodes.length && items.length < cap; i++) {
+      const el = nodes[i];
+      const row = { tag: el.tagName.toLowerCase() };
+      for (const f of want) {
+        try {
+          if (f === 'text') row.text = (el.innerText || el.textContent || '').trim().slice(0, 400);
+          else if (f === 'html') row.html = el.innerHTML.slice(0, 4000);
+          else if (f === 'href') row.href = el.href || el.getAttribute('href') || undefined;
+          else if (f === 'value') row.value = (el.value != null) ? String(el.value).slice(0, 400) : undefined;
+          else if (f === 'src') row.src = el.src || el.getAttribute('src') || undefined;
+          else if (f === 'alt') row.alt = el.alt || el.getAttribute('alt') || undefined;
+          else if (f === 'id') row.id = el.id || undefined;
+          else if (f === 'name') row.name = el.name || undefined;
+          else if (f === 'bounds') {
+            const r = el.getBoundingClientRect();
+            row.bounds = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
+          } else if (f === 'attrs') {
+            const a = {};
+            for (const att of el.attributes) a[att.name] = att.value.slice(0, 200);
+            row.attrs = a;
+          } else {
+            // arbitrary attribute name
+            const v = el.getAttribute(f);
+            if (v != null) row[f] = v.slice(0, 400);
+          }
+        } catch {}
+      }
+      // Strip undefined for compact output
+      for (const k of Object.keys(row)) if (row[k] === undefined) delete row[k];
+      items.push(row);
+    }
+    return { count: items.length, total: nodes.length, truncated: nodes.length > items.length, items };
+  }
+
+  // ── HTML / bounds / computed style ──
+  function getHTML(selector) {
+    const el = resolveElement(selector);
+    if (!el) return { error: 'Element not found' };
+    const outer = el.outerHTML || '';
+    const truncated = outer.length > 100000;
+    return { html: outer.slice(0, 100000), length: outer.length, ...(truncated && { truncated: true }) };
+  }
+
+  function getBounds(selector) {
+    const el = resolveElement(selector);
+    if (!el) return { error: 'Element not found' };
+    const r = el.getBoundingClientRect();
+    return {
+      x: r.x, y: r.y, width: r.width, height: r.height,
+      top: r.top, right: r.right, bottom: r.bottom, left: r.left,
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      page: { width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight },
+      inView: r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth,
+    };
+  }
+
+  function getComputedStyleFor(selector, properties) {
+    const el = resolveElement(selector);
+    if (!el) return { error: 'Element not found' };
+    const cs = window.getComputedStyle(el);
+    if (properties && properties.length) {
+      const out = {};
+      for (const p of properties) out[p] = cs.getPropertyValue(p);
+      return { computed: out };
+    }
+    // No props specified → return commonly-needed ones
+    const common = ['display','position','visibility','opacity','width','height','color','background-color','font-size','font-family','font-weight','margin','padding','border','z-index','overflow','cursor'];
+    const out = {};
+    for (const p of common) out[p] = cs.getPropertyValue(p);
+    return { computed: out };
+  }
+
+  // ── Links / images / meta / structured data ──
+  function getLinks(internalOnly) {
+    const origin = location.origin;
+    const out = [];
+    for (const a of document.querySelectorAll('a[href]')) {
+      const href = a.href;
+      const isInternal = href.startsWith(origin);
+      if (internalOnly && !isInternal) continue;
+      out.push({
+        href,
+        text: (a.innerText || '').trim().slice(0, 200),
+        rel: a.rel || undefined,
+        target: a.target || undefined,
+        internal: isInternal,
+      });
+      if (out.length >= 500) break;
+    }
+    return { count: out.length, links: out };
+  }
+
+  function getImages() {
+    const out = [];
+    for (const img of document.images) {
+      const r = img.getBoundingClientRect();
+      out.push({
+        src: img.currentSrc || img.src,
+        alt: img.alt || '',
+        width: img.naturalWidth || Math.round(r.width),
+        height: img.naturalHeight || Math.round(r.height),
+        loading: img.loading || undefined,
+      });
+      if (out.length >= 200) break;
+    }
+    return { count: out.length, images: out };
+  }
+
+  function getMeta() {
+    const meta = {};
+    for (const m of document.querySelectorAll('meta')) {
+      const key = m.getAttribute('name') || m.getAttribute('property') || m.getAttribute('itemprop') || m.getAttribute('http-equiv');
+      const val = m.getAttribute('content');
+      if (key && val) meta[key] = val.slice(0, 600);
+    }
+    const link = {};
+    for (const l of document.querySelectorAll('link[rel]')) {
+      const rel = l.getAttribute('rel');
+      if (!rel) continue;
+      (link[rel] = link[rel] || []).push(l.href || l.getAttribute('href'));
+    }
+    return {
+      title: document.title,
+      url: location.href,
+      canonical: link.canonical && link.canonical[0],
+      meta,
+      links: link,
+    };
+  }
+
+  function getStructuredData() {
+    const jsonld = [];
+    for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try { jsonld.push(JSON.parse(s.textContent)); } catch {}
+    }
+    const og = {}, twitter = {};
+    for (const m of document.querySelectorAll('meta')) {
+      const prop = m.getAttribute('property') || '';
+      const name = m.getAttribute('name') || '';
+      const c = m.getAttribute('content');
+      if (!c) continue;
+      if (prop.startsWith('og:')) og[prop.slice(3)] = c;
+      else if (name.startsWith('twitter:')) twitter[name.slice(8)] = c;
+    }
+    return { jsonld, openGraph: og, twitter };
+  }
+
+  // ── Readability (simple heuristic) ──
+  function getReadability() {
+    // Score candidates by text density and tag suitability.
+    const candidates = document.querySelectorAll('article, [role="main"], main, .post, .article, .content, .entry, .markdown-body, #content, #main, [itemprop="articleBody"]');
+    let best = null, bestScore = 0;
+    const score = (el) => {
+      const text = (el.innerText || '').trim();
+      if (text.length < 200) return 0;
+      const links = el.querySelectorAll('a').length;
+      const paras = el.querySelectorAll('p').length;
+      const linkDensity = (el.querySelectorAll('a').reduce ? 0 : Array.from(el.querySelectorAll('a')).reduce((s,a)=>s+(a.innerText||'').length,0)) / text.length;
+      return text.length * (1 + paras * 0.05) * (1 - Math.min(0.9, linkDensity));
+    };
+    for (const c of candidates) {
+      const s = score(c);
+      if (s > bestScore) { bestScore = s; best = c; }
+    }
+    if (!best) {
+      // Fall back to densest <div> or <section>
+      for (const c of document.querySelectorAll('section, div')) {
+        const s = score(c);
+        if (s > bestScore) { bestScore = s; best = c; }
+      }
+    }
+    if (!best) best = document.body;
+    const clone = best.cloneNode(true);
+    // Strip nav/aside/footer noise
+    clone.querySelectorAll('nav, aside, footer, header, script, style, noscript, .ad, .ads, .advert, [aria-hidden="true"]').forEach(n => n.remove());
+    const text = (clone.innerText || '').trim();
+    const meta = getMeta();
+    const sd = getStructuredData();
+    const article = (sd.jsonld || []).find(j => j['@type'] === 'Article' || j['@type'] === 'NewsArticle' || (Array.isArray(j['@type']) && j['@type'].includes('Article')));
+    return {
+      title: document.title,
+      url: location.href,
+      excerpt: meta.meta?.description || meta.meta?.['og:description'] || text.slice(0, 240),
+      byline: article?.author?.name || article?.author || meta.meta?.author,
+      published: article?.datePublished || meta.meta?.['article:published_time'],
+      siteName: meta.meta?.['og:site_name'],
+      length: text.length,
+      textContent: text.slice(0, 50000),
+      truncated: text.length > 50000,
+      score: bestScore,
+      container: best.tagName.toLowerCase() + (best.id ? '#' + best.id : '') + (best.className && typeof best.className === 'string' ? '.' + best.className.split(/\s+/).slice(0,2).join('.') : ''),
+    };
+  }
+
+  // ── Markdown export (in-house, DOM walker) ──
+  function getMarkdown(selector) {
+    const root = selector ? document.querySelector(selector) : document.body;
+    if (!root) return { error: 'Element not found' };
+    function walk(node, depth) {
+      if (node.nodeType === 3) return node.textContent.replace(/\s+/g, ' ');
+      if (node.nodeType !== 1) return '';
+      const tag = node.tagName.toLowerCase();
+      if (['script','style','noscript','svg','iframe','nav','aside','footer','header','form'].includes(tag)) return '';
+      const children = () => Array.from(node.childNodes).map(c => walk(c, depth+1)).join('');
+      switch (tag) {
+        case 'h1': return '\n\n# ' + children().trim() + '\n\n';
+        case 'h2': return '\n\n## ' + children().trim() + '\n\n';
+        case 'h3': return '\n\n### ' + children().trim() + '\n\n';
+        case 'h4': return '\n\n#### ' + children().trim() + '\n\n';
+        case 'h5': return '\n\n##### ' + children().trim() + '\n\n';
+        case 'h6': return '\n\n###### ' + children().trim() + '\n\n';
+        case 'p':  return '\n\n' + children().trim() + '\n\n';
+        case 'br': return '  \n';
+        case 'hr': return '\n\n---\n\n';
+        case 'strong': case 'b': return '**' + children() + '**';
+        case 'em': case 'i': return '*' + children() + '*';
+        case 'code': {
+          if (node.parentElement && node.parentElement.tagName === 'PRE') return children();
+          return '`' + children() + '`';
+        }
+        case 'pre': return '\n\n```\n' + (node.innerText || '') + '\n```\n\n';
+        case 'a': {
+          const href = node.getAttribute('href') || '';
+          const t = children().trim();
+          return href ? '[' + t + '](' + href + ')' : t;
+        }
+        case 'img': {
+          const src = node.getAttribute('src') || '';
+          const alt = node.getAttribute('alt') || '';
+          return '![' + alt + '](' + src + ')';
+        }
+        case 'ul': {
+          let out = '\n';
+          for (const li of node.querySelectorAll(':scope > li')) {
+            out += '- ' + Array.from(li.childNodes).map(c => walk(c, depth+1)).join('').trim() + '\n';
+          }
+          return out + '\n';
+        }
+        case 'ol': {
+          let out = '\n', i = 1;
+          for (const li of node.querySelectorAll(':scope > li')) {
+            out += (i++) + '. ' + Array.from(li.childNodes).map(c => walk(c, depth+1)).join('').trim() + '\n';
+          }
+          return out + '\n';
+        }
+        case 'blockquote': return '\n> ' + children().trim().replace(/\n/g, '\n> ') + '\n\n';
+        case 'table': {
+          let out = '\n\n';
+          const rows = node.querySelectorAll('tr');
+          if (rows.length === 0) return '';
+          rows.forEach((row, idx) => {
+            const cells = Array.from(row.querySelectorAll('th, td')).map(c => (c.innerText||'').replace(/\|/g,'\\|').trim());
+            out += '| ' + cells.join(' | ') + ' |\n';
+            if (idx === 0) out += '| ' + cells.map(() => '---').join(' | ') + ' |\n';
+          });
+          return out + '\n';
+        }
+        default: return children();
+      }
+    }
+    const md = walk(root, 0).replace(/\n{3,}/g, '\n\n').trim();
+    const truncated = md.length > 80000;
+    return { markdown: md.slice(0, 80000), length: md.length, ...(truncated && { truncated: true }) };
+  }
+
+  // ── Interaction additions ──
+  function selectOption(selector, value, byText) {
+    const el = resolveElement(selector);
+    if (!el) return { error: 'Element not found' };
+    if (el.tagName !== 'SELECT') return { error: 'Element is not a <select>' };
+    let matched = null;
+    for (const opt of el.options) {
+      if (byText ? (opt.text === value || opt.text.trim() === String(value).trim()) : opt.value === value) {
+        matched = opt; break;
+      }
+    }
+    if (!matched) return { error: `No matching option for ${byText ? 'text' : 'value'}: ${value}` };
+    el.value = matched.value;
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    return { ok: true, value: el.value, text: matched.text };
+  }
+
+  function checkBox(selector, checked) {
+    const el = resolveElement(selector);
+    if (!el) return { error: 'Element not found' };
+    if (el.type !== 'checkbox' && el.type !== 'radio') return { error: 'Element is not a checkbox/radio' };
+    el.checked = !!checked;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true, checked: el.checked };
+  }
+
+  function focusEl(selector) {
+    const el = resolveElement(selector);
+    if (!el) return { error: 'Element not found' };
+    el.focus();
+    return { ok: true, active: document.activeElement === el };
+  }
+
+  function blurEl(selector) {
+    const el = selector ? resolveElement(selector) : document.activeElement;
+    if (!el) return { error: 'Element not found' };
+    if (typeof el.blur === 'function') el.blur();
+    return { ok: true };
+  }
+
+  function keypress(selector, key, modifiers, text) {
+    const target = selector ? resolveElement(selector) : (document.activeElement || document.body);
+    if (!target) return { error: 'No target' };
+    const mods = modifiers || {};
+    const opts = {
+      key,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      ctrlKey: !!mods.ctrl,
+      shiftKey: !!mods.shift,
+      altKey: !!mods.alt,
+      metaKey: !!mods.meta,
+    };
+    target.dispatchEvent(new KeyboardEvent('keydown', opts));
+    if (text) {
+      target.dispatchEvent(new KeyboardEvent('keypress', opts));
+      // Insert text into editable targets
+      if (target.isContentEditable) {
+        document.execCommand('insertText', false, text);
+      } else if (['INPUT','TEXTAREA'].includes(target.tagName)) {
+        const proto = target.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(target, (target.value || '') + text);
+        else target.value = (target.value || '') + text;
+        target.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }
+    target.dispatchEvent(new KeyboardEvent('keyup', opts));
+    return { ok: true, key, target: target.tagName?.toLowerCase() };
+  }
+
+  function doubleClick(selector) {
+    const el = resolveElement(selector);
+    if (!el) return { error: 'Element not found' };
+    el.scrollIntoView({ behavior: 'instant', block: 'center' });
+    const r = el.getBoundingClientRect();
+    const init = { bubbles: true, cancelable: true, composed: true, view: window, clientX: r.x + r.width/2, clientY: r.y + r.height/2, button: 0 };
+    el.dispatchEvent(new MouseEvent('mousedown', init));
+    el.dispatchEvent(new MouseEvent('mouseup', init));
+    el.dispatchEvent(new MouseEvent('click', init));
+    el.dispatchEvent(new MouseEvent('mousedown', init));
+    el.dispatchEvent(new MouseEvent('mouseup', init));
+    el.dispatchEvent(new MouseEvent('click', init));
+    el.dispatchEvent(new MouseEvent('dblclick', { ...init, detail: 2 }));
+    return { ok: true };
+  }
+
+  function submitForm(selector) {
+    let form;
+    if (selector) {
+      const el = resolveElement(selector);
+      if (!el) return { error: 'Element not found' };
+      form = el.tagName === 'FORM' ? el : el.closest('form');
+    } else {
+      form = document.querySelector('form');
+    }
+    if (!form) return { error: 'No <form> found' };
+    // Prefer the submit-button click path so form-validation listeners fire.
+    const btn = form.querySelector('button[type="submit"], input[type="submit"]');
+    if (btn) { btn.click(); return { ok: true, submitted: 'button' }; }
+    form.submit();
+    return { ok: true, submitted: 'method' };
+  }
+
+  function formFill(fieldMap) {
+    if (!fieldMap || typeof fieldMap !== 'object') return { error: 'fields must be an object' };
+    const results = {};
+    for (const key of Object.keys(fieldMap)) {
+      const value = fieldMap[key];
+      // Try as CSS selector first
+      let el = null;
+      try { el = document.querySelector(key); } catch {}
+      // Try by name attr
+      if (!el) el = document.querySelector(`[name="${CSS.escape(key)}"]`);
+      // Try by label text
+      if (!el) {
+        for (const lbl of document.querySelectorAll('label')) {
+          const t = (lbl.innerText || '').trim();
+          if (t.toLowerCase().includes(key.toLowerCase())) {
+            if (lbl.htmlFor) el = document.getElementById(lbl.htmlFor);
+            else el = lbl.querySelector('input, textarea, select');
+            if (el) break;
+          }
+        }
+      }
+      // Try by placeholder
+      if (!el) {
+        for (const inp of document.querySelectorAll('input[placeholder], textarea[placeholder]')) {
+          if (inp.placeholder.toLowerCase().includes(key.toLowerCase())) { el = inp; break; }
+        }
+      }
+      if (!el) { results[key] = { error: 'Not found' }; continue; }
+      try {
+        if (el.tagName === 'SELECT') {
+          el.value = value;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          results[key] = { ok: true, tag: 'select', value: el.value };
+        } else if (el.type === 'checkbox' || el.type === 'radio') {
+          el.checked = !!value;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          results[key] = { ok: true, tag: el.tagName.toLowerCase(), checked: el.checked };
+        } else {
+          el.focus();
+          const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(el, String(value));
+          else el.value = String(value);
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          results[key] = { ok: true, tag: el.tagName.toLowerCase() };
+        }
+      } catch (e) {
+        results[key] = { error: e.message };
+      }
+    }
+    return { results };
+  }
+
+  function dragElement(fromSel, toSel) {
+    const from = resolveElement(fromSel);
+    const to = resolveElement(toSel);
+    if (!from) return { error: 'from element not found' };
+    if (!to) return { error: 'to element not found' };
+    const fr = from.getBoundingClientRect();
+    const tr = to.getBoundingClientRect();
+    const fx = fr.x + fr.width/2, fy = fr.y + fr.height/2;
+    const tx = tr.x + tr.width/2, ty = tr.y + tr.height/2;
+    const dt = new DataTransfer();
+    const dispatch = (target, type, x, y, related) => {
+      const ev = new DragEvent(type, { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, dataTransfer: dt, relatedTarget: related || null });
+      target.dispatchEvent(ev);
+    };
+    from.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: fx, clientY: fy, button: 0 }));
+    dispatch(from, 'dragstart', fx, fy);
+    dispatch(from, 'drag', fx, fy);
+    dispatch(to, 'dragenter', tx, ty);
+    dispatch(to, 'dragover', tx, ty);
+    dispatch(to, 'drop', tx, ty);
+    dispatch(from, 'dragend', tx, ty);
+    to.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: tx, clientY: ty, button: 0 }));
+    return { ok: true, from: fromSel, to: toSel };
+  }
+
+  // ── waitForUrl / waitForTitle ──
+  function waitForUrl(pattern, timeout) {
+    const max = timeout || 10000;
+    const start = Date.now();
+    const re = new RegExp(pattern);
+    return new Promise((resolve) => {
+      const tick = () => {
+        if (re.test(location.href)) return resolve({ ok: true, url: location.href, elapsed: Date.now() - start });
+        if (Date.now() - start >= max) return resolve({ ok: false, url: location.href, error: 'Timed out' });
+        setTimeout(tick, 200);
+      };
+      tick();
+    });
+  }
+
+  function waitForTitle(pattern, timeout) {
+    const max = timeout || 10000;
+    const start = Date.now();
+    const re = new RegExp(pattern);
+    return new Promise((resolve) => {
+      const tick = () => {
+        if (re.test(document.title)) return resolve({ ok: true, title: document.title, elapsed: Date.now() - start });
+        if (Date.now() - start >= max) return resolve({ ok: false, title: document.title, error: 'Timed out' });
+        setTimeout(tick, 200);
+      };
+      tick();
+    });
+  }
+
+  // ── Network: PerformanceObserver-based capture + idle wait ──
+  const __netState = window.__zenlinkNet = window.__zenlinkNet || { entries: [], observer: null, capture: false };
+
+  function ensureNetObserver() {
+    if (__netState.observer) return;
+    try {
+      __netState.observer = new PerformanceObserver((list) => {
+        if (!__netState.capture) return;
+        for (const e of list.getEntries()) {
+          __netState.entries.push({
+            url: e.name,
+            initiator: e.initiatorType,
+            startTime: Math.round(e.startTime),
+            duration: Math.round(e.duration),
+            transferSize: e.transferSize,
+            responseStatus: e.responseStatus,
+          });
+          if (__netState.entries.length > 1000) __netState.entries.shift();
+        }
+      });
+      __netState.observer.observe({ type: 'resource', buffered: true });
+    } catch (e) {
+      // PerformanceObserver may not be available everywhere
+    }
+  }
+
+  function captureNetwork(op, since) {
+    ensureNetObserver();
+    if (op === 'start') {
+      __netState.capture = true;
+      __netState.entries.length = 0;
+      return { ok: true, capturing: true };
+    }
+    if (op === 'stop') {
+      __netState.capture = false;
+      return { ok: true, capturing: false, count: __netState.entries.length };
+    }
+    if (op === 'clear') {
+      __netState.entries.length = 0;
+      return { ok: true, cleared: true };
+    }
+    // Default: read
+    const sinceMs = since || 0;
+    const entries = sinceMs ? __netState.entries.filter(e => e.startTime >= sinceMs) : __netState.entries.slice();
+    return { capturing: __netState.capture, count: entries.length, entries: entries.slice(-500) };
+  }
+
+  function waitForNetworkIdle(idleMs, timeout) {
+    ensureNetObserver();
+    const idleThreshold = idleMs || 500;
+    const max = timeout || 10000;
+    return new Promise((resolve) => {
+      const start = Date.now();
+      let lastSize = 0, idleSince = Date.now();
+      const tick = () => {
+        const cur = performance.getEntriesByType('resource').length;
+        if (cur !== lastSize) {
+          lastSize = cur;
+          idleSince = Date.now();
+        }
+        if (Date.now() - idleSince >= idleThreshold) {
+          return resolve({ ok: true, elapsed: Date.now() - start, resourceCount: cur });
+        }
+        if (Date.now() - start >= max) {
+          return resolve({ ok: false, elapsed: Date.now() - start, resourceCount: cur, error: 'Timed out' });
+        }
+        setTimeout(tick, 100);
+      };
+      tick();
+    });
+  }
+
+  // ── Console intercept ──
+  const __conState = window.__zenlinkConsole = window.__zenlinkConsole || { enabled: false, logs: [], patched: false };
+
+  function watchConsole(enabled) {
+    __conState.enabled = !!enabled;
+    if (enabled && !__conState.patched) {
+      __conState.patched = true;
+      for (const lvl of ['log','info','warn','error','debug']) {
+        const orig = console[lvl].bind(console);
+        console[lvl] = function(...args) {
+          try {
+            __conState.logs.push({
+              level: lvl,
+              time: Date.now(),
+              message: args.map(a => {
+                try { return typeof a === 'string' ? a : JSON.stringify(a); } catch { return String(a); }
+              }).join(' ').slice(0, 2000),
+            });
+            if (__conState.logs.length > 500) __conState.logs.shift();
+          } catch {}
+          orig(...args);
+        };
+      }
+      window.addEventListener('error', (e) => {
+        __conState.logs.push({ level: 'error', time: Date.now(), message: (e.message || 'error') + ' at ' + (e.filename || '') + ':' + (e.lineno || 0) });
+        if (__conState.logs.length > 500) __conState.logs.shift();
+      });
+    }
+    return { ok: true, enabled: __conState.enabled, buffered: __conState.logs.length };
+  }
+
+  function consoleLogs(since, level) {
+    let logs = __conState.logs.slice();
+    if (since) logs = logs.filter(l => l.time >= since);
+    if (level) logs = logs.filter(l => l.level === level);
+    return { count: logs.length, logs: logs.slice(-200) };
+  }
+
+  // ── localStorage / sessionStorage ──
+  function storageOp(kind, op, key, value) {
+    const store = kind === 'session' ? window.sessionStorage : window.localStorage;
+    try {
+      if (op === 'get') return { ok: true, key, value: store.getItem(key) };
+      if (op === 'set') { store.setItem(key, String(value)); return { ok: true }; }
+      if (op === 'remove') { store.removeItem(key); return { ok: true }; }
+      if (op === 'clear') { store.clear(); return { ok: true }; }
+      if (op === 'list') {
+        const out = {};
+        for (let i = 0; i < store.length; i++) {
+          const k = store.key(i);
+          out[k] = (store.getItem(k) || '').slice(0, 500);
+        }
+        return { ok: true, count: Object.keys(out).length, items: out };
+      }
+      if (op === 'snapshot') {
+        const out = {};
+        for (let i = 0; i < store.length; i++) {
+          const k = store.key(i);
+          out[k] = store.getItem(k);
+        }
+        return { ok: true, items: out };
+      }
+      if (op === 'restore') {
+        // value is expected to be an object
+        store.clear();
+        for (const k of Object.keys(value || {})) store.setItem(k, String(value[k]));
+        return { ok: true, restored: Object.keys(value || {}).length };
+      }
+      return { error: 'Unknown storage op: ' + op };
+    } catch (e) {
+      return { error: e.message };
+    }
+  }
+
+  // ── iframes ──
+  function getIframes() {
+    const out = [];
+    for (const f of document.querySelectorAll('iframe, frame')) {
+      const r = f.getBoundingClientRect();
+      let accessible = false, sameOrigin = false;
+      try { sameOrigin = !!f.contentDocument; accessible = sameOrigin; } catch {}
+      out.push({
+        src: f.src || f.getAttribute('src') || '',
+        name: f.name || f.getAttribute('name') || '',
+        id: f.id || '',
+        sameOrigin,
+        accessible,
+        bounds: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+      });
+    }
+    return { count: out.length, iframes: out };
+  }
+
+  // ── explain selector ──
+  function explainSelector(selector) {
+    if (!selector) return { error: 'selector required' };
+    let nodes;
+    try { nodes = document.querySelectorAll(selector); } catch (e) { return { error: 'Invalid: ' + e.message }; }
+    const samples = [];
+    for (let i = 0; i < Math.min(nodes.length, 5); i++) {
+      const el = nodes[i];
+      const r = el.getBoundingClientRect();
+      samples.push({
+        tag: el.tagName.toLowerCase(),
+        text: (el.innerText || el.textContent || '').trim().slice(0, 120),
+        id: el.id || undefined,
+        cls: typeof el.className === 'string' ? el.className.slice(0, 100) : undefined,
+        visible: !isHidden(el),
+        bounds: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+      });
+    }
+    // Suggest a more-specific selector if there are too many matches
+    const suggestions = [];
+    if (nodes.length > 5) {
+      const first = nodes[0];
+      if (first.id) suggestions.push('#' + first.id);
+      if (first.dataset && Object.keys(first.dataset).length) {
+        const k = Object.keys(first.dataset)[0];
+        suggestions.push(`[data-${k}="${first.dataset[k]}"]`);
+      }
+      if (first.getAttribute('role')) suggestions.push(`[role="${first.getAttribute('role')}"]`);
+    }
+    return { selector, matches: nodes.length, samples, suggestions };
+  }
+
+  function fullPageMetrics() {
+    return {
+      docWidth: document.documentElement.scrollWidth,
+      docHeight: document.documentElement.scrollHeight,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      devicePixelRatio: window.devicePixelRatio || 1,
+    };
   }
 
 })();

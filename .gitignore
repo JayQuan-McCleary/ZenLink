@@ -8,3 +8,13 @@ __pycache__/
 web-ext-artifacts/
 .amo-upload-uuid
 *.xpi
+
+# PyInstaller build artifacts
+native/build/
+native/dist/
+
+# Local agent config
+.claude/
+
+# Inno Setup build output
+installer/output/

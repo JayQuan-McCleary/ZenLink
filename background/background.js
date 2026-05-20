@@ -3,7 +3,7 @@
 
 'use strict';
 
-const EXPECTED_CONTENT_VERSION = 11;
+const EXPECTED_CONTENT_VERSION = 14;
 const WS_URL = 'ws://127.0.0.1:8766';
 let ws = null;
 let reconnectTimer = null;
@@ -165,8 +165,34 @@ async function handleCommand(command) {
     case 'switchTab':    return await switchTab(params.tabId);
     case 'newTab':       return await createTab(params.url);
     case 'closeTab':     return await closeTab(params.tabId);
+    case 'wakeTab':      return await wakeTab(params.tabId);
+    case 'reloadExtension': return reloadExtensionAction();
     case 'getPageTextFromTab': return await forwardToContent('getPageText', params);
-    
+
+    // 1.4.0 browser-level additions
+    case 'pinTab':           return await updateTab(params.tabId, { pinned: !!params.pinned });
+    case 'muteTab':          return await updateTab(params.tabId, { muted: !!params.muted });
+    case 'duplicateTab':     return await duplicateTab(params.tabId);
+    case 'reloadTabBrowser': return await reloadTabBrowser(params.tabId, params.bypassCache);
+    case 'goBack':           return await goBack(params.tabId);
+    case 'goForward':        return await goForward(params.tabId);
+    case 'getZoom':          return await getZoom(params.tabId);
+    case 'setZoom':          return await setZoom(params.tabId, params.factor);
+    case 'getWindows':       return await getWindowsList();
+    case 'createWindow':     return await createWindow(params.url, params.incognito);
+    case 'closeWindow':      return await closeWindow(params.windowId);
+    case 'focusWindow':      return await focusWindow(params.windowId);
+    case 'moveTab':          return await moveTabAction(params.tabId, params.windowId, params.index);
+    case 'detachTab':        return await detachTab(params.tabId);
+    case 'elementScreenshot':return await elementScreenshot(params.tabId, params.selector);
+    case 'fullPageScreenshot': return await fullPageScreenshot(params.tabId);
+    case 'cookies':          return await cookiesOp(params.op, params.url, params.name, params.value, params.domain, params.path, params.secure);
+    case 'clipboard':        return await clipboardOp(params.op, params.text);
+    case 'downloads':        return await downloadsOp(params.op, params.url, params.filename, params.query);
+    case 'clearBrowsingData':return await clearBrowsingData(params.types, params.since);
+    case 'intercept':        return await interceptOp(params.op, params.patterns, params.effect);
+    case 'clickAndWaitNavigation': return await clickAndWaitNavigation(params.tabId, params.selector, params.timeout);
+
     // Content script commands (forwarded to active tab)
     case 'getPageInfo':
     case 'getPageText':
@@ -174,6 +200,7 @@ async function handleCommand(command) {
     case 'getFormFields':
     case 'click':
     case 'type':
+    case 'setEditableContent':
     case 'scroll':
     case 'hover':
     case 'fill':
@@ -183,8 +210,38 @@ async function handleCommand(command) {
     case 'clearHighlight':
     case 'waitForElement':
     case 'waitForResult':
+    // 1.4.0 forwarded actions
+    case 'query':
+    case 'getHTML':
+    case 'getLinks':
+    case 'getImages':
+    case 'getMeta':
+    case 'getStructuredData':
+    case 'getBounds':
+    case 'getComputedStyle':
+    case 'getReadability':
+    case 'getMarkdown':
+    case 'selectOption':
+    case 'checkBox':
+    case 'focusElement':
+    case 'blurElement':
+    case 'keypress':
+    case 'doubleClick':
+    case 'submitForm':
+    case 'formFill':
+    case 'drag':
+    case 'waitForUrl':
+    case 'waitForTitle':
+    case 'waitForNetworkIdle':
+    case 'captureNetwork':
+    case 'watchConsole':
+    case 'consoleLogs':
+    case 'storageOp':
+    case 'getIframes':
+    case 'explainSelector':
+    case 'fullPageMetrics':
       return await forwardToContent(action, params);
-    
+
     default:
       return { error: `Unknown action: ${action}` };
   }
@@ -291,6 +348,47 @@ async function closeTab(tabId) {
   }
 }
 
+function reloadExtensionAction() {
+  // Defer the reload so we can ack first — the WS dies the moment we reload,
+  // and the bridge's pending future would otherwise hang. The new background
+  // script comes up cold and reconnects via the existing onclose backoff.
+  setTimeout(() => {
+    try { browser.runtime.reload(); } catch (e) { console.error('[Claude Bridge] Reload failed:', e); }
+  }, 100);
+  return { ok: true, reloading: true };
+}
+
+async function wakeTab(tabId) {
+  // Reload a discarded tab and wait for it to be ready. Idempotent — returns
+  // immediately if the tab is already alive. Use before sending commands to a
+  // tab that may have been idle long enough for Zen's Tab Unloader to discard.
+  if (!tabId) return { error: 'wakeTab requires tabId' };
+  try {
+    const tab = await browser.tabs.get(tabId);
+    if (!tab.discarded) {
+      return { ok: true, woken: false, discarded: false };
+    }
+    await browser.tabs.reload(tabId);
+    const ready = await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        browser.tabs.onUpdated.removeListener(listener);
+        resolve(false);
+      }, 15000);
+      function listener(updatedTabId, changeInfo) {
+        if (updatedTabId === tabId && changeInfo.status === 'complete') {
+          clearTimeout(timeout);
+          browser.tabs.onUpdated.removeListener(listener);
+          resolve(true);
+        }
+      }
+      browser.tabs.onUpdated.addListener(listener);
+    });
+    return { ok: true, woken: true, ready };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
 // == Forward to Content Script ==
 
 async function forwardToContent(action, params) {
@@ -356,6 +454,369 @@ async function fillViaExecScript(tabId, selector, value) {
   } catch (e) {
     return { error: 'execScript fill error: ' + e.message };
   }
+}
+
+// ══════════════════════════════════════════════════════════════
+// 1.4.0 — browser-level handler implementations
+// ══════════════════════════════════════════════════════════════
+
+async function updateTab(tabId, props) {
+  try {
+    const id = tabId || (await getActiveTabId());
+    if (!id) return { error: 'No tab' };
+    const tab = await browser.tabs.update(id, props);
+    return { ok: true, tabId: id, pinned: tab.pinned, muted: tab.mutedInfo?.muted };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function duplicateTab(tabId) {
+  try {
+    const id = tabId || (await getActiveTabId());
+    if (!id) return { error: 'No tab' };
+    const dup = await browser.tabs.duplicate(id);
+    return { ok: true, tabId: dup.id, sourceTabId: id };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function reloadTabBrowser(tabId, bypassCache) {
+  try {
+    const id = tabId || (await getActiveTabId());
+    if (!id) return { error: 'No tab' };
+    await browser.tabs.reload(id, { bypassCache: !!bypassCache });
+    return { ok: true, tabId: id, bypassCache: !!bypassCache };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function goBack(tabId) {
+  try {
+    const id = tabId || (await getActiveTabId());
+    if (!id) return { error: 'No tab' };
+    await browser.tabs.goBack(id);
+    return { ok: true, tabId: id };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function goForward(tabId) {
+  try {
+    const id = tabId || (await getActiveTabId());
+    if (!id) return { error: 'No tab' };
+    await browser.tabs.goForward(id);
+    return { ok: true, tabId: id };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function getZoom(tabId) {
+  try {
+    const id = tabId || (await getActiveTabId());
+    if (!id) return { error: 'No tab' };
+    const factor = await browser.tabs.getZoom(id);
+    return { ok: true, tabId: id, factor };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function setZoom(tabId, factor) {
+  try {
+    const id = tabId || (await getActiveTabId());
+    if (!id) return { error: 'No tab' };
+    await browser.tabs.setZoom(id, Number(factor) || 1);
+    return { ok: true, tabId: id, factor: Number(factor) || 1 };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function getWindowsList() {
+  try {
+    const wins = await browser.windows.getAll({ populate: true });
+    return {
+      count: wins.length,
+      windows: wins.map(w => ({
+        id: w.id, focused: w.focused, state: w.state, type: w.type,
+        width: w.width, height: w.height, left: w.left, top: w.top,
+        incognito: w.incognito,
+        tabs: (w.tabs || []).map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active, pinned: t.pinned })),
+      })),
+    };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function createWindow(url, incognito) {
+  try {
+    const w = await browser.windows.create({
+      url: url ? (Array.isArray(url) ? url : [url]) : undefined,
+      incognito: !!incognito,
+    });
+    return { ok: true, windowId: w.id, tabIds: (w.tabs || []).map(t => t.id) };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function closeWindow(windowId) {
+  try {
+    await browser.windows.remove(windowId);
+    return { ok: true, windowId };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function focusWindow(windowId) {
+  try {
+    await browser.windows.update(windowId, { focused: true });
+    return { ok: true, windowId };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function moveTabAction(tabId, windowId, index) {
+  try {
+    const moved = await browser.tabs.move(tabId, { windowId, index: index ?? -1 });
+    return { ok: true, tabId, windowId, index: Array.isArray(moved) ? moved[0]?.index : moved.index };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function detachTab(tabId) {
+  try {
+    const w = await browser.windows.create({ tabId });
+    return { ok: true, windowId: w.id, tabId };
+  } catch (e) { return { error: e.message }; }
+}
+
+// ── Element / full-page screenshot ──
+async function elementScreenshot(tabId, selector) {
+  try {
+    const id = tabId || (await getActiveTabId());
+    if (!id || !selector) return { error: 'tabId and selector required' };
+    const tab = await browser.tabs.get(id);
+    if (isRestrictedUrl(tab.url)) return { error: 'Cannot access browser internal page' };
+    const bounds = await forwardToContent('getBounds', { tabId: id, selector });
+    if (bounds.error) return bounds;
+    // Scroll element into view first
+    await forwardToContent('scroll', { tabId: id, direction: 'top' });
+    await forwardToContent('executeJS', {
+      tabId: id,
+      code: `(()=>{const e=document.querySelector(${JSON.stringify(selector)}); if(e)e.scrollIntoView({block:'center',inline:'center',behavior:'instant'}); return e?.getBoundingClientRect();})()`,
+    });
+    // Take a viewport screenshot
+    const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+    // Get fresh bounds after scroll
+    const b2 = await forwardToContent('getBounds', { tabId: id, selector });
+    const dpr = b2.viewport?.dpr || 1;
+    // Crop using OffscreenCanvas (extension context)
+    const img = await loadDataUrl(dataUrl);
+    const canvas = new OffscreenCanvas(Math.round(b2.width), Math.round(b2.height));
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, Math.round(b2.x * dpr), Math.round(b2.y * dpr), Math.round(b2.width * dpr), Math.round(b2.height * dpr), 0, 0, Math.round(b2.width), Math.round(b2.height));
+    const blob = await canvas.convertToBlob({ type: 'image/png' });
+    const buf = await blob.arrayBuffer();
+    const cropped = arrayBufferToDataUrl(buf, 'image/png');
+    return { ok: true, selector, bounds: { x: b2.x, y: b2.y, width: b2.width, height: b2.height }, dataUrl: cropped };
+  } catch (e) { return { error: 'elementScreenshot failed: ' + e.message }; }
+}
+
+async function fullPageScreenshot(tabId) {
+  try {
+    const id = tabId || (await getActiveTabId());
+    if (!id) return { error: 'No tab' };
+    const tab = await browser.tabs.get(id);
+    if (isRestrictedUrl(tab.url)) return { error: 'Cannot access browser internal page' };
+    const m = await forwardToContent('fullPageMetrics', { tabId: id });
+    if (m.error) return m;
+    const segments = [];
+    let y = 0;
+    const guard = 30; // Max 30 viewports tall
+    let i = 0;
+    while (y < m.docHeight && i < guard) {
+      await forwardToContent('executeJS', { tabId: id, code: `window.scrollTo(0, ${y}); 1` });
+      await new Promise(r => setTimeout(r, 120)); // Let lazy content settle
+      const data = await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+      segments.push({ y, data });
+      y += m.viewportHeight;
+      i++;
+    }
+    // Stitch with OffscreenCanvas
+    const canvas = new OffscreenCanvas(Math.round(m.docWidth), Math.round(m.docHeight));
+    const ctx = canvas.getContext('2d');
+    for (const seg of segments) {
+      const img = await loadDataUrl(seg.data);
+      const drawH = Math.min(m.viewportHeight, m.docHeight - seg.y);
+      ctx.drawImage(img, 0, 0, img.width, drawH * (img.height / m.viewportHeight), 0, seg.y, img.width, drawH);
+    }
+    const blob = await canvas.convertToBlob({ type: 'image/png' });
+    const buf = await blob.arrayBuffer();
+    return { ok: true, width: m.docWidth, height: m.docHeight, segments: segments.length, dataUrl: arrayBufferToDataUrl(buf, 'image/png') };
+  } catch (e) { return { error: 'fullPageScreenshot failed: ' + e.message }; }
+}
+
+async function loadDataUrl(dataUrl) {
+  const resp = await fetch(dataUrl);
+  const blob = await resp.blob();
+  return await createImageBitmap(blob);
+}
+
+function arrayBufferToDataUrl(buf, mime) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+  return 'data:' + mime + ';base64,' + btoa(bin);
+}
+
+// ── Cookies ──
+async function cookiesOp(op, url, name, value, domain, path, secure) {
+  try {
+    if (op === 'get') {
+      const all = await browser.cookies.getAll({ url, domain, name });
+      return { ok: true, count: all.length, cookies: all };
+    }
+    if (op === 'set') {
+      const c = await browser.cookies.set({ url, name, value: String(value), domain, path, secure: !!secure });
+      return { ok: true, cookie: c };
+    }
+    if (op === 'remove') {
+      const r = await browser.cookies.remove({ url, name });
+      return { ok: true, removed: !!r };
+    }
+    if (op === 'clear') {
+      const all = await browser.cookies.getAll({ url, domain });
+      for (const c of all) {
+        const u = (c.secure ? 'https://' : 'http://') + c.domain.replace(/^\./, '') + c.path;
+        try { await browser.cookies.remove({ url: u, name: c.name }); } catch {}
+      }
+      return { ok: true, removed: all.length };
+    }
+    return { error: 'Unknown cookies op: ' + op };
+  } catch (e) { return { error: e.message }; }
+}
+
+// ── Clipboard ──
+async function clipboardOp(op, text) {
+  try {
+    if (op === 'read') {
+      const t = await navigator.clipboard.readText();
+      return { ok: true, text: t };
+    }
+    if (op === 'write') {
+      await navigator.clipboard.writeText(String(text ?? ''));
+      return { ok: true, length: String(text ?? '').length };
+    }
+    return { error: 'Unknown clipboard op: ' + op };
+  } catch (e) { return { error: 'clipboard ' + op + ' failed: ' + e.message }; }
+}
+
+// ── Downloads ──
+async function downloadsOp(op, url, filename, query) {
+  try {
+    if (op === 'download') {
+      const id = await browser.downloads.download({ url, filename, conflictAction: 'uniquify' });
+      return { ok: true, downloadId: id };
+    }
+    if (op === 'list') {
+      const items = await browser.downloads.search(query || { limit: 20, orderBy: ['-startTime'] });
+      return { ok: true, count: items.length, items };
+    }
+    if (op === 'cancel') {
+      await browser.downloads.cancel(query?.id);
+      return { ok: true };
+    }
+    return { error: 'Unknown downloads op: ' + op };
+  } catch (e) { return { error: e.message }; }
+}
+
+// ── Browsing data ──
+async function clearBrowsingData(types, since) {
+  try {
+    const opts = since ? { since } : {};
+    const dataTypes = {};
+    for (const t of (types || ['cache','cookies','history','localStorage','passwords','downloads'])) dataTypes[t] = true;
+    await browser.browsingData.remove(opts, dataTypes);
+    return { ok: true, cleared: Object.keys(dataTypes), since };
+  } catch (e) { return { error: e.message }; }
+}
+
+// ── Request interception ──
+const __intercept = { rules: [], listening: false, requestLog: [], maxLog: 500 };
+
+function interceptListener(details) {
+  __intercept.requestLog.push({
+    time: Date.now(),
+    url: details.url,
+    method: details.method,
+    tabId: details.tabId,
+    type: details.type,
+  });
+  if (__intercept.requestLog.length > __intercept.maxLog) __intercept.requestLog.shift();
+  for (const rule of __intercept.rules) {
+    try {
+      if (new RegExp(rule.pattern).test(details.url)) {
+        if (rule.action === 'block') return { cancel: true };
+        if (rule.action === 'redirect' && rule.target) return { redirectUrl: rule.target };
+      }
+    } catch {}
+  }
+  return {};
+}
+
+async function interceptOp(op, patterns, effect) {
+  try {
+    if (op === 'add') {
+      for (const p of (patterns || [])) __intercept.rules.push({ pattern: p, action: effect || 'block' });
+      ensureInterceptListener();
+      return { ok: true, rules: __intercept.rules.length };
+    }
+    if (op === 'clear') {
+      __intercept.rules.length = 0;
+      removeInterceptListener();
+      return { ok: true, rules: 0 };
+    }
+    if (op === 'list') {
+      return { ok: true, rules: __intercept.rules.slice(), logged: __intercept.requestLog.length };
+    }
+    if (op === 'log') {
+      return { ok: true, count: __intercept.requestLog.length, requests: __intercept.requestLog.slice(-200) };
+    }
+    if (op === 'clearLog') {
+      __intercept.requestLog.length = 0;
+      return { ok: true };
+    }
+    return { error: 'Unknown intercept op: ' + op };
+  } catch (e) { return { error: e.message }; }
+}
+
+function ensureInterceptListener() {
+  if (__intercept.listening) return;
+  try {
+    browser.webRequest.onBeforeRequest.addListener(interceptListener, { urls: ['<all_urls>'] }, ['blocking']);
+    __intercept.listening = true;
+  } catch (e) {
+    console.error('[Claude Bridge] webRequest unavailable:', e);
+  }
+}
+
+function removeInterceptListener() {
+  if (!__intercept.listening) return;
+  try {
+    browser.webRequest.onBeforeRequest.removeListener(interceptListener);
+    __intercept.listening = false;
+  } catch {}
+}
+
+// ── Click and wait for navigation ──
+async function clickAndWaitNavigation(tabId, selector, timeout) {
+  try {
+    const id = tabId || (await getActiveTabId());
+    if (!id || !selector) return { error: 'tabId and selector required' };
+    const t0 = Date.now();
+    const navPromise = new Promise((resolve) => {
+      const max = timeout || 15000;
+      const to = setTimeout(() => { browser.tabs.onUpdated.removeListener(listener); resolve({ ok: false, timedOut: true }); }, max);
+      function listener(updatedTabId, changeInfo, tab) {
+        if (updatedTabId === id && changeInfo.status === 'complete') {
+          clearTimeout(to);
+          browser.tabs.onUpdated.removeListener(listener);
+          resolve({ ok: true, url: tab.url, title: tab.title, elapsed: Date.now() - t0 });
+        }
+      }
+      browser.tabs.onUpdated.addListener(listener);
+    });
+    const click = await forwardToContent('click', { tabId: id, selector });
+    if (click.error) return { ...click, clicked: false };
+    const nav = await navPromise;
+    return { ok: true, clicked: true, navigation: nav };
+  } catch (e) { return { error: e.message }; }
 }
 
 // == Init ==

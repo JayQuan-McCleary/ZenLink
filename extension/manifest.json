@@ -1,7 +1,7 @@
-﻿{
+{
   "manifest_version": 2,
   "name": "ZenLink",
-  "version": "1.1.2",
+  "version": "2.0.0",
   "description": "Lets Claude Desktop control Zen Browser via local bridge server",
   "icons": {
     "48": "icons/icon-48.png",
@@ -10,7 +10,14 @@
   "permissions": [
     "activeTab",
     "tabs",
-    "<all_urls>"
+    "<all_urls>",
+    "cookies",
+    "webRequest",
+    "webRequestBlocking",
+    "downloads",
+    "clipboardRead",
+    "clipboardWrite",
+    "browsingData"
   ],
   "background": {
     "scripts": ["background/background.js"]
@@ -18,11 +25,10 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "zenlink@jayquan.dev",
-      "strict_min_version": "109.0",
+      "strict_min_version": "140.0",
       "data_collection_permissions": {
         "required": ["none"]
       }
     }
   }
 }
-

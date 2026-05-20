@@ -1,8 +1,10 @@
 # ZenLink
 
-Browser automation bridge for Zen Browser & Firefox � control your browser through a simple HTTP API.
+Browser automation bridge for Zen Browser & Firefox — control your browser through a simple HTTP API.
 
 Built as a fast, working alternative to Chrome MCP. Works with any AI assistant, automation tool, or script that can make HTTP requests.
+
+**v2.0.0 — Parallel agentic work.** Adds ~50 new endpoints for real multi-tab parallelism (`/api/broadcast`, `/api/sync-barrier`, `/api/tab-pool`), tab unloader defense (`/api/keep-alive`, `/api/wake-tab`), content extraction (`/api/readability`, `/api/markdown`, `/api/query`), request interception (`/api/intercept`), session save/restore (`/api/save-session`), and a scriptable `batch` with variables / `if` / `while` / `try` / `retry`. Plus the matching MCP package: [zenlink-mcp on PyPI](https://pypi.org/project/zenlink-mcp/). Full notes in [CHANGELOG.md](CHANGELOG.md).
 
 ## Why ZenLink?
 
@@ -118,6 +120,7 @@ curl http://localhost:8765/api/status
 | `/api/switch-tab` | `{"tabId": 123}` | Focus a tab |
 | `/api/click` | `{"selector": "..."}` or `{"coords": {"x":0,"y":0}}` | Click element |
 | `/api/type` | `{"selector": "...", "text": "...", "clear": true}` | Type into input |
+| `/api/set-editable-content` | `{"selector": "...", "value": "...", "format": "text"}` | Replace contenteditable/input/textarea content in one fast operation |
 | `/api/fill` | `{"selector": "...", "value": "..."}` | Set form field value |
 | `/api/scroll` | `{"direction": "down", "amount": 1}` | Scroll page (`amount` = viewport heights, default 1) |
 | `/api/hover` | `{"selector": "..."}` | Hover over element |
@@ -148,7 +151,7 @@ POST http://localhost:8765/api/batch
 }
 ```
 
-Available batch actions: `navigate`, `newTab`, `closeTab`, `switchTab`, `click`, `type`, `fill`, `scroll`, `hover`, `find`, `js`, `pageInfo`, `pageText`, `pageTextByTabId`, `screenshot`, `tabs`, `forms`, `dom`, `highlight`, `waitForElement`, `waitForResult`, `sleep`, `parallel`
+Available batch actions: `navigate`, `newTab`, `closeTab`, `switchTab`, `click`, `type`, `setEditableContent`, `fill`, `scroll`, `hover`, `find`, `js`, `pageInfo`, `pageText`, `pageTextByTabId`, `screenshot`, `tabs`, `forms`, `dom`, `highlight`, `waitForElement`, `waitForResult`, `sleep`, `parallel`
 
 **`stopOnWarning`**: Set to `true` to halt batch execution if any command returns a `warning` (e.g. `expectTitle` redirect mismatch) or `error`. The halting result will include `_stopped: true`.
 
