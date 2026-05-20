@@ -576,13 +576,31 @@ async function detachTab(tabId) {
   } catch (e) { return { error: e.message }; }
 }
 
+async function activateTabForCapture(tabId) {
+  const tab = await browser.tabs.get(tabId);
+  const activeTabs = await browser.tabs.query({ windowId: tab.windowId, active: true });
+  const previousTabId = activeTabs[0]?.id !== tabId ? activeTabs[0]?.id : null;
+  if (previousTabId) {
+    await browser.tabs.update(tabId, { active: true });
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return { tab, previousTabId };
+}
+
+async function restoreTabAfterCapture(previousTabId) {
+  if (!previousTabId) return;
+  try { await browser.tabs.update(previousTabId, { active: true }); } catch {}
+}
+
 // ── Element / full-page screenshot ──
 async function elementScreenshot(tabId, selector) {
+  let previousTabId = null;
   try {
     const id = tabId || (await getActiveTabId());
     if (!id || !selector) return { error: 'tabId and selector required' };
     const tab = await browser.tabs.get(id);
     if (isRestrictedUrl(tab.url)) return { error: 'Cannot access browser internal page' };
+    ({ previousTabId } = await activateTabForCapture(id));
     const bounds = await forwardToContent('getBounds', { tabId: id, selector });
     if (bounds.error) return bounds;
     // Scroll element into view first
@@ -606,14 +624,17 @@ async function elementScreenshot(tabId, selector) {
     const cropped = arrayBufferToDataUrl(buf, 'image/png');
     return { ok: true, selector, bounds: { x: b2.x, y: b2.y, width: b2.width, height: b2.height }, dataUrl: cropped };
   } catch (e) { return { error: 'elementScreenshot failed: ' + e.message }; }
+  finally { await restoreTabAfterCapture(previousTabId); }
 }
 
 async function fullPageScreenshot(tabId) {
+  let previousTabId = null;
   try {
     const id = tabId || (await getActiveTabId());
     if (!id) return { error: 'No tab' };
     const tab = await browser.tabs.get(id);
     if (isRestrictedUrl(tab.url)) return { error: 'Cannot access browser internal page' };
+    ({ previousTabId } = await activateTabForCapture(id));
     const m = await forwardToContent('fullPageMetrics', { tabId: id });
     if (m.error) return m;
     const segments = [];
@@ -640,6 +661,7 @@ async function fullPageScreenshot(tabId) {
     const buf = await blob.arrayBuffer();
     return { ok: true, width: m.docWidth, height: m.docHeight, segments: segments.length, dataUrl: arrayBufferToDataUrl(buf, 'image/png') };
   } catch (e) { return { error: 'fullPageScreenshot failed: ' + e.message }; }
+  finally { await restoreTabAfterCapture(previousTabId); }
 }
 
 async function loadDataUrl(dataUrl) {

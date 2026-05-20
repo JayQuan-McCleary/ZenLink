@@ -42,7 +42,7 @@ except ImportError:
     from websockets.server import serve as ws_serve
 
 # ── Config ──
-BRIDGE_VERSION = "2.0.0"
+BRIDGE_VERSION = "2.0.3"
 API_VERSION = "1"
 HTTP_PORT = 8765
 WS_PORT = 8766
@@ -96,6 +96,12 @@ def _cache_set(key, data):
         cutoff = time.time() - CACHE_TTL
         for k in [k for k, (t, _) in _cache.items() if t < cutoff]:
             del _cache[k]
+
+
+def _cache_clear(reason=None):
+    """Clear short-lived read cache after browser/page mutations."""
+    if _cache:
+        _cache.clear()
 
 
 def _focus_window_by_title(title):
@@ -256,13 +262,13 @@ def _audit(action, params, ok, error, ms):
 
 WRITE_ACTIONS = {
     "click", "type", "setEditableContent", "scroll", "hover", "fill",
-    "navigate", "newTab", "closeTab", "switchTab", "executeJS",
+    "navigate", "newTab", "closeTab", "switchTab", "executeJS", "trustedClick",
     "selectOption", "checkBox", "keypress", "doubleClick", "submitForm",
     "formFill", "drag", "cookies", "clipboard", "downloads",
     "clearBrowsingData", "intercept", "clickAndWaitNavigation",
     "pinTab", "muteTab", "duplicateTab", "reloadTabBrowser", "goBack", "goForward",
     "setZoom", "createWindow", "closeWindow", "moveTab", "detachTab",
-    "storageOp", "reloadExtension",
+    "storageOp", "reloadExtension", "wakeTab", "highlight", "clearHighlight",
 }
 
 
@@ -295,6 +301,11 @@ def _check_policy(action, params):
             if not ok:
                 return {"error": f"URL not in allowlist: {url}"}
     return None
+
+
+def _invalidate_cache_for_action(action):
+    if action in WRITE_ACTIONS or action in ("elementScreenshot", "fullPageScreenshot"):
+        _cache_clear(action)
 
 
 # ── Orchestration: broadcast and syncBarrier ──
@@ -730,6 +741,12 @@ async def run_command(cmd):
         if action == 'find' and 'query' not in params and 'selector' in params:
             params['query'] = params.pop('selector')
 
+        effective_action = BATCH_ACTION_MAP.get(action, action)
+        policy_err = _check_policy(effective_action, params)
+        if policy_err:
+            return policy_err
+        _invalidate_cache_for_action(effective_action)
+
         # Simple forwarding actions (the majority)
         if action in BATCH_ACTION_MAP:
             return await send_to_extension(BATCH_ACTION_MAP[action], params)
@@ -1104,46 +1121,59 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_json(200, {"workflows": available, "directory": WORKFLOW_DIR})
 
     # ── POST Handlers ──
+
+    def _send_extension_action(self, action, body, timeout=35):
+        policy_err = _check_policy(action, body)
+        if policy_err:
+            self.send_json(403, policy_err)
+            return
+        _invalidate_cache_for_action(action)
+        t0 = time.time()
+        try:
+            result = self.run_async(send_to_extension(action, body, timeout=timeout), timeout=timeout + 5)
+        except Exception as e:
+            result = {"error": str(e)}
+        _audit(
+            action,
+            body,
+            isinstance(result, dict) and not result.get("error"),
+            (result or {}).get("error") if isinstance(result, dict) else None,
+            (time.time() - t0) * 1000,
+        )
+        self.send_json(200, result)
     
     def handle_click(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("click", body))
-        self.send_json(200, result)
+        self._send_extension_action("click", self.read_body())
 
     def handle_trusted_click(self):
         body = self.read_body()
+        policy_err = _check_policy("trustedClick", body)
+        if policy_err:
+            self.send_json(403, policy_err)
+            return
+        _invalidate_cache_for_action("trustedClick")
+        t0 = time.time()
         result = self.run_async(trusted_click(body))
+        _audit("trustedClick", body, isinstance(result, dict) and not result.get("error"), (result or {}).get("error") if isinstance(result, dict) else None, (time.time() - t0) * 1000)
         self.send_json(200, result)
     
     def handle_type(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("type", body))
-        self.send_json(200, result)
+        self._send_extension_action("type", self.read_body())
 
     def handle_set_editable_content(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("setEditableContent", body))
-        self.send_json(200, result)
+        self._send_extension_action("setEditableContent", self.read_body())
     
     def handle_scroll(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("scroll", body))
-        self.send_json(200, result)
+        self._send_extension_action("scroll", self.read_body())
     
     def handle_hover(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("hover", body))
-        self.send_json(200, result)
+        self._send_extension_action("hover", self.read_body())
     
     def handle_fill(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("fill", body))
-        self.send_json(200, result)
+        self._send_extension_action("fill", self.read_body())
     
     def handle_navigate(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("navigate", body))
-        self.send_json(200, result)
+        self._send_extension_action("navigate", self.read_body())
     
     def handle_find(self):
         body = self.read_body()
@@ -1154,33 +1184,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_json(200, result)
     
     def handle_js(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("executeJS", body))
-        self.send_json(200, result)
+        self._send_extension_action("executeJS", self.read_body())
     
     def handle_highlight(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("highlight", body))
-        self.send_json(200, result)
+        self._send_extension_action("highlight", self.read_body())
 
     def handle_clear_highlight(self):
-        result = self.run_async(send_to_extension("clearHighlight", {}))
-        self.send_json(200, result)
+        self._send_extension_action("clearHighlight", {})
 
     def handle_close_tab(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("closeTab", body))
-        self.send_json(200, result)
+        self._send_extension_action("closeTab", self.read_body())
 
     def handle_switch_tab(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("switchTab", body))
-        self.send_json(200, result)
+        self._send_extension_action("switchTab", self.read_body())
 
     def handle_new_tab(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("newTab", body))
-        self.send_json(200, result)
+        self._send_extension_action("newTab", self.read_body())
 
     def handle_wait_for_element(self):
         body = self.read_body()
@@ -1203,9 +1222,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_json(200, result)
 
     def handle_wake_tab(self):
-        body = self.read_body()
-        result = self.run_async(send_to_extension("wakeTab", body, timeout=20))
-        self.send_json(200, result)
+        self._send_extension_action("wakeTab", self.read_body(), timeout=20)
 
     def handle_keep_alive(self):
         body = self.read_body()
@@ -1236,8 +1253,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         # Extension acks then reloads itself ~100ms later. Use a short timeout
         # — if no ack arrives, the extension is unreachable and reloading is
         # moot anyway.
-        result = self.run_async(send_to_extension("reloadExtension", {}, timeout=5))
-        self.send_json(200, result)
+        self._send_extension_action("reloadExtension", {}, timeout=5)
 
     # ── 1.4.0 generic forwarder ──
 
@@ -1248,9 +1264,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if policy_err:
             self.send_json(403, policy_err)
             return
+        _invalidate_cache_for_action(action)
         t0 = time.time()
         try:
-            result = self.run_async(send_to_extension(action, body, timeout=default_timeout))
+            result = self.run_async(send_to_extension(action, body, timeout=default_timeout), timeout=default_timeout + 5)
         except Exception as e:
             result = {"error": str(e)}
         _audit(action, body, isinstance(result, dict) and not result.get("error"), (result or {}).get("error") if isinstance(result, dict) else None, (time.time() - t0) * 1000)

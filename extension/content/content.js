@@ -393,10 +393,9 @@
   // ── Scroll ──
   function scrollPage(direction, amount, selector) {
     const target = selector ? resolveElement(selector) : null;
-    // amount now means viewport-heights (1 = one full viewport, default = 1)
-    // This ensures lazy-loading intersection observers actually trigger
-    const viewportH = window.innerHeight;
-    const dist = Math.round((amount || 1) * viewportH);
+    // amount is pixels; keep this aligned with the MCP tool contract.
+    const parsed = Number(amount);
+    const dist = Number.isFinite(parsed) ? Math.round(parsed) : 500;
     const opts = { behavior: 'smooth' };
 
     if (direction === 'top') {
@@ -843,7 +842,7 @@
     return {
       x: r.x, y: r.y, width: r.width, height: r.height,
       top: r.top, right: r.right, bottom: r.bottom, left: r.left,
-      viewport: { width: window.innerWidth, height: window.innerHeight },
+      viewport: { width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio || 1 },
       page: { width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight },
       inView: r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth,
     };

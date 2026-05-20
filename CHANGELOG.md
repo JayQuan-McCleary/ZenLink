@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.3
+
+- Fixed read-only policy enforcement for core write actions and batch commands.
+- Cleared short-lived read caches after browser/page mutations so immediate
+  reads after navigation do not return stale page data.
+- Fixed tab-targeted element/full-page screenshots by activating the requested
+  tab for capture and restoring the previous active tab afterward.
+- Restored `scroll` amount semantics to pixels to match the MCP/API contract.
+- Added device pixel ratio metadata to element bounds for screenshot cropping.
+
 ## 2.0.2
 
 - Added `extension/icons/*.png` to git tracking. The synced extension tree was
