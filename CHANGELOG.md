@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.4
+
+- Metadata-only listed AMO submission build.
+- No code changes from 2.0.3; AMO requires a unique version number because
+  2.0.3 already exists as a self-distributed version.
+
 ## 2.0.3
 
 - Fixed read-only policy enforcement for core write actions and batch commands.

@@ -42,7 +42,7 @@ except ImportError:
     from websockets.server import serve as ws_serve
 
 # ── Config ──
-BRIDGE_VERSION = "2.0.3"
+BRIDGE_VERSION = "2.0.4"
 API_VERSION = "1"
 HTTP_PORT = 8765
 WS_PORT = 8766
