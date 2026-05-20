@@ -1,0 +1,81 @@
+name: Sign extension and attach to release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'AMO channel'
+        required: true
+        default: 'unlisted'
+        type: choice
+        options:
+          - unlisted
+          - listed
+
+jobs:
+  sign:
+    name: web-ext sign → AMO → release asset
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # to attach the signed xpi to the existing release
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '20'
+
+      - name: Install web-ext
+        run: npm install --global web-ext@10.1.0
+
+      - name: Resolve channel
+        id: channel
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "value=unlisted" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.channel }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign extension
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          set -euo pipefail
+          cd extension
+          web-ext sign \
+            --channel="${{ steps.channel.outputs.value }}" \
+            --source-dir=. \
+            --artifacts-dir=../signed \
+            --api-key="$WEB_EXT_API_KEY" \
+            --api-secret="$WEB_EXT_API_SECRET" \
+            --timeout=600000   # 10 minutes; listed channel can take longer
+
+      - name: Locate signed xpi
+        id: artifact
+        run: |
+          set -euo pipefail
+          xpi=$(ls signed/*.xpi | head -1)
+          echo "path=$xpi" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$xpi")" >> "$GITHUB_OUTPUT"
+          ls -la signed/
+
+      - name: Attach signed xpi to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "${{ steps.artifact.outputs.path }}" \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+      - name: Upload signed xpi as workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
