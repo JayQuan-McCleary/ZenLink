@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.png
-!icons/*.png
+!**/icons/*.png
 .env
 
 web-ext-artifacts/

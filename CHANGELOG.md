@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.0.2
+
+- Added `extension/icons/*.png` to git tracking. The synced extension tree was
+  missing the icon PNGs because they'd never been `git add`-ed, so CI runs of
+  `web-ext sign` failed validation with "An icon defined in the manifest could
+  not be found in the package."
+
+## 2.0.1
+
+- Bumped `manifest.json` `strict_min_version` from 140.0 → 142.0 so AMO's
+  automated linter accepts the `browser_specific_settings.gecko.data_collection_permissions`
+  field (added in Firefox 142). Lets the CI auto-sign workflow succeed.
+- No code changes from 2.0.0.
+
 ## 2.0.0 — Parallel agentic work
 
 Major release. Adds ~50 new bridge actions and orchestration primitives aimed
@@ -95,10 +109,3 @@ at AI agents that need to drive multiple browser tabs in parallel.
 ## 1.1.2 — and earlier
 
 See git history.
-
-## 2.0.1
-
-- Bumped `manifest.json` `strict_min_version` from 140.0 → 142.0 so AMO's
-  automated linter accepts the `browser_specific_settings.gecko.data_collection_permissions`
-  field (added in Firefox 142). Lets the CI auto-sign workflow succeed.
-- No code changes from 2.0.0.
