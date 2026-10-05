@@ -4,7 +4,7 @@ Browser automation bridge for Zen Browser & Firefox — control your browser thr
 
 Built as a fast, working alternative to Chrome MCP. Works with any AI assistant, automation tool, or script that can make HTTP requests.
 
-**v2.0.0 — Parallel agentic work.** Adds ~50 new endpoints for real multi-tab parallelism (`/api/broadcast`, `/api/sync-barrier`, `/api/tab-pool`), tab unloader defense (`/api/keep-alive`, `/api/wake-tab`), content extraction (`/api/readability`, `/api/markdown`, `/api/query`), request interception (`/api/intercept`), session save/restore (`/api/save-session`), and a scriptable `batch` with variables / `if` / `while` / `try` / `retry`. Plus the matching MCP package: [zenlink-mcp on PyPI](https://pypi.org/project/zenlink-mcp/). Full notes in [CHANGELOG.md](CHANGELOG.md).
+**v2.0.0 — Parallel agentic work.** Adds ~50 new endpoints for real multi-tab parallelism (`/api/broadcast`, `/api/sync-barrier`, `/api/tab-pool`), tab unloader defense (`/api/keep-alive`, `/api/wake-tab`), content extraction (`/api/readability`, `/api/markdown`, `/api/query`), request interception (`/api/intercept`), session save/restore (`/api/save-session`), and a scriptable `batch` with variables / `if` / `while` / `try` / `retry`. Current main also includes bridge-side per-tab scheduling so multiple agents can safely drive different tabs through the same extension connection. Plus the matching MCP package: [zenlink-mcp on PyPI](https://pypi.org/project/zenlink-mcp/). Full notes in [CHANGELOG.md](CHANGELOG.md).
 
 ## Why ZenLink?
 
@@ -116,7 +116,7 @@ curl http://localhost:8765/api/status
 |----------|------|-------------|
 | `/api/navigate` | `{"url": "...", "expectTitle": "..."}` | Load URL (optional title check for redirect detection) |
 | `/api/new-tab` | `{"url": "..."}` | Open URL in new tab |
-| `/api/close-tab` | `{"tabId": 123}` | Close tab by ID |
+| `/api/close-tab` | `{"tabId": 123, "force": true}` | Close tab by ID (`force` disarms "Leave page?" prompts first) |
 | `/api/switch-tab` | `{"tabId": 123}` | Focus a tab |
 | `/api/click` | `{"selector": "..."}` or `{"coords": {"x":0,"y":0}}` | Click element |
 | `/api/type` | `{"selector": "...", "text": "...", "clear": true}` | Type into input |
@@ -125,13 +125,17 @@ curl http://localhost:8765/api/status
 | `/api/scroll` | `{"direction": "down", "amount": 1}` | Scroll page (`amount` = viewport heights, default 1) |
 | `/api/hover` | `{"selector": "..."}` | Hover over element |
 | `/api/find` | `{"query": "login button"}` | Find elements by description |
-| `/api/js` | `{"code": "document.title"}` | Execute JavaScript (50KB result limit, returns `truncated: true` if exceeded) |
+| `/api/js` | `{"code": "document.title", "full": true}` | Execute JavaScript (8 MB result limit; `full: true` reads any size back in slices) |
 | `/api/highlight` | `{"selector": "..."}` | Visual overlay on element |
 | `/api/clear-highlight` | _(none)_ | Remove all highlight overlays |
 | `/api/page-text-by-tab-id` | `{"tabId": 123}` | Extract text from a specific tab (not just active) |
 | `/api/wait-for-element` | `{"selector": "...", "timeout": 10000}` | Poll until element appears in DOM |
 | `/api/wait-for-result` | `{"code": "...", "timeout": 15000}` | Poll JS expression until it returns non-empty |
 | `/api/batch` | `{"commands": [...], "stopOnWarning": true}` | Run multiple commands (stops on warning/error if flag set) |
+
+Multi-word HTTP routes use kebab-case, and the bridge also accepts common
+camelCase aliases such as `/api/pageInfo`, `/api/pageText`, `/api/executeJS`,
+and `/api/waitForElement`.
 
 ### Batch Commands
 
@@ -153,11 +157,31 @@ POST http://localhost:8765/api/batch
 
 Available batch actions: `navigate`, `newTab`, `closeTab`, `switchTab`, `click`, `type`, `setEditableContent`, `fill`, `scroll`, `hover`, `find`, `js`, `pageInfo`, `pageText`, `pageTextByTabId`, `screenshot`, `tabs`, `forms`, `dom`, `highlight`, `waitForElement`, `waitForResult`, `sleep`, `parallel`
 
+### Multi-Agent Scheduling
+
+ZenLink accepts simultaneous HTTP clients. The bridge schedules commands by
+scope:
+
+- Commands with `tabId` run through that tab's queue.
+- Commands for different tabs may overlap.
+- Commands that rely on the active tab, browser-wide state, or screenshot/
+  capture APIs run through a global queue that waits for active tab work and
+  blocks new tab work until complete.
+- WebSocket sends to the extension are serialized so command IDs and responses
+  cannot interleave unsafely.
+
+Use `/api/scheduler` or `/api/health` to inspect pending commands and active
+or queued scopes, plus the shared/exclusive gate state, while multiple agents
+are working.
+
+Run `pwsh ./test_scheduler.ps1` with the bridge and extension running to
+regression-test route aliases, cross-tab overlap, and same-tab queue reporting.
+
 **`stopOnWarning`**: Set to `true` to halt batch execution if any command returns a `warning` (e.g. `expectTitle` redirect mismatch) or `error`. The halting result will include `_stopped: true`.
 
 **`expectTitle`** on navigate: Pass `"expectTitle": "keyword"` to check the loaded page title. If the title doesn't contain the keyword (case-insensitive), the result includes `warning` and `redirected: true` — useful for catching silent URL redirects.
 
-**`parallel`**: Run multiple command sequences concurrently. Each sequence runs its commands in order, but all sequences execute at the same time. Commands that target the active tab (like `navigate`) **must** include an explicit `tabId` to avoid race conditions.
+**`parallel`**: Run multiple command sequences concurrently. Each sequence runs its commands in order, but all sequences execute at the same time. Commands that target a page should include an explicit `tabId`; the bridge serializes commands per tab and uses a global lock for active-tab/capture/browser-wide actions.
 
 ```json
 {

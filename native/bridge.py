@@ -27,7 +27,8 @@ import os
 import sys
 import time
 import ctypes
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from contextlib import asynccontextmanager
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 from datetime import datetime
 
@@ -42,7 +43,7 @@ except ImportError:
     from websockets.server import serve as ws_serve
 
 # ── Config ──
-BRIDGE_VERSION = "2.0.4"
+BRIDGE_VERSION = "2.1.0"
 API_VERSION = "1"
 HTTP_PORT = 8765
 WS_PORT = 8766
@@ -51,8 +52,15 @@ WORKFLOW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "w
 
 # ── State ──
 extension_ws = None  # WebSocket connection to extension
-pending_commands = {}  # id -> asyncio.Future
+extension_ws_generation = 0
+pending_commands = {}  # id -> {"future": asyncio.Future, "ws": websocket, ...}
 command_counter = 0
+_ws_send_lock = None
+_global_command_lock = None
+_tab_command_locks = {}
+_scheduler_gate = None
+_scheduler_active = {}
+_scheduler_queued = {}
 
 # ── Cache ──
 import re as _re
@@ -136,6 +144,254 @@ def _focus_window_by_title(title):
     return user32.GetForegroundWindow() == hwnd
 
 
+_NO_SCHEDULE_ACTIONS = {"ping", "getTabs", "getWindows"}
+_GLOBAL_SCOPE_ACTIONS = {
+    "screenshot", "switchTab", "newTab", "closeTab", "trustedClick",
+    "reloadExtension", "createWindow", "closeWindow", "focusWindow",
+    "moveTab", "detachTab", "elementScreenshot", "fullPageScreenshot",
+    "cookies", "clipboard", "downloads", "clearBrowsingData", "intercept",
+}
+
+
+_API_ALIASES = {
+    "/api/pageInfo": "/api/page-info",
+    "/api/pageText": "/api/page-text",
+    "/api/pageTextByTabId": "/api/page-text-by-tab-id",
+    "/api/executeJS": "/api/js",
+    "/api/trustedClick": "/api/trusted-click",
+    "/api/setEditableContent": "/api/set-editable-content",
+    "/api/clearHighlight": "/api/clear-highlight",
+    "/api/closeTab": "/api/close-tab",
+    "/api/switchTab": "/api/switch-tab",
+    "/api/newTab": "/api/new-tab",
+    "/api/waitForElement": "/api/wait-for-element",
+    "/api/waitForResult": "/api/wait-for-result",
+    "/api/wakeTab": "/api/wake-tab",
+    "/api/keepAlive": "/api/keep-alive",
+    "/api/keepAliveStop": "/api/keep-alive-stop",
+    "/api/reloadExtension": "/api/reload-extension",
+    "/api/structuredData": "/api/structured-data",
+    "/api/computedStyle": "/api/computed-style",
+    "/api/selectOption": "/api/select-option",
+    "/api/doubleClick": "/api/double-click",
+    "/api/submitForm": "/api/submit-form",
+    "/api/formFill": "/api/form-fill",
+    "/api/waitForUrl": "/api/wait-for-url",
+    "/api/waitForTitle": "/api/wait-for-title",
+    "/api/waitForNetworkIdle": "/api/wait-for-network-idle",
+    "/api/captureNetwork": "/api/capture-network",
+    "/api/watchConsole": "/api/watch-console",
+    "/api/consoleLogs": "/api/console-logs",
+    "/api/explainSelector": "/api/explain-selector",
+    "/api/fullPageMetrics": "/api/full-page-metrics",
+    "/api/pinTab": "/api/pin-tab",
+    "/api/muteTab": "/api/mute-tab",
+    "/api/duplicateTab": "/api/duplicate-tab",
+    "/api/reloadTab": "/api/reload-tab",
+    "/api/getZoom": "/api/get-zoom",
+    "/api/setZoom": "/api/set-zoom",
+    "/api/createWindow": "/api/create-window",
+    "/api/closeWindow": "/api/close-window",
+    "/api/focusWindow": "/api/focus-window",
+    "/api/moveTab": "/api/move-tab",
+    "/api/detachTab": "/api/detach-tab",
+    "/api/elementScreenshot": "/api/element-screenshot",
+    "/api/fullPageScreenshot": "/api/full-page-screenshot",
+    "/api/clearBrowsingData": "/api/clear-browsing-data",
+    "/api/clickAndWaitNavigation": "/api/click-and-wait-navigation",
+    "/api/syncBarrier": "/api/sync-barrier",
+    "/api/tagTab": "/api/tag-tab",
+    "/api/resolveTag": "/api/resolve-tag",
+    "/api/listTags": "/api/list-tags",
+    "/api/untagTab": "/api/untag-tab",
+    "/api/tabPool": "/api/tab-pool",
+    "/api/poolAcquire": "/api/pool-acquire",
+    "/api/poolRelease": "/api/pool-release",
+    "/api/saveSession": "/api/save-session",
+    "/api/loadSession": "/api/load-session",
+    "/api/listSessions": "/api/list-sessions",
+    "/api/deleteSession": "/api/delete-session",
+    "/api/setPolicy": "/api/set-policy",
+    "/api/getPolicy": "/api/get-policy",
+}
+
+
+class _SchedulerGate:
+    def __init__(self):
+        self._cond = asyncio.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    async def acquire_read(self):
+        async with self._cond:
+            while self._writer or self._waiting_writers > 0:
+                await self._cond.wait()
+            self._readers += 1
+
+    async def release_read(self):
+        async with self._cond:
+            self._readers = max(0, self._readers - 1)
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    async def acquire_write(self):
+        async with self._cond:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers > 0:
+                    await self._cond.wait()
+                self._writer = True
+            finally:
+                self._waiting_writers = max(0, self._waiting_writers - 1)
+
+    async def release_write(self):
+        async with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+    def snapshot(self):
+        return {
+            "active_tab_scopes": self._readers,
+            "global_active": self._writer,
+            "global_waiting": self._waiting_writers,
+        }
+
+
+def _coerce_tab_id(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scheduler_snapshot():
+    queued_scopes = {k: v for k, v in _scheduler_queued.items() if v > 0}
+    gate = _scheduler_gate.snapshot() if _scheduler_gate is not None else {
+        "active_tab_scopes": 0,
+        "global_active": False,
+        "global_waiting": 0,
+    }
+    return {
+        "mode": "threaded-http/per-tab-queue",
+        "pending_commands": len(pending_commands),
+        "queued_commands": sum(queued_scopes.values()),
+        "active_scopes": dict(_scheduler_active),
+        "queued_scopes": queued_scopes,
+        "gate": gate,
+        "tab_locks": sorted(_tab_command_locks.keys()),
+    }
+
+
+def _get_scheduler_gate():
+    global _scheduler_gate
+    if _scheduler_gate is None:
+        _scheduler_gate = _SchedulerGate()
+    return _scheduler_gate
+
+
+@asynccontextmanager
+async def _scheduler_gate_lease(scope):
+    gate = _get_scheduler_gate()
+    if scope[0] == "global":
+        await gate.acquire_write()
+        try:
+            yield
+        finally:
+            await gate.release_write()
+    else:
+        await gate.acquire_read()
+        try:
+            yield
+        finally:
+            await gate.release_read()
+
+
+def _get_ws_send_lock():
+    global _ws_send_lock
+    if _ws_send_lock is None:
+        _ws_send_lock = asyncio.Lock()
+    return _ws_send_lock
+
+
+def _get_scope_lock(scope):
+    global _global_command_lock
+    if scope[0] == "global":
+        if _global_command_lock is None:
+            _global_command_lock = asyncio.Lock()
+        return _global_command_lock
+
+    tab_id = scope[1]
+    lock = _tab_command_locks.get(tab_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _tab_command_locks[tab_id] = lock
+    return lock
+
+
+def _command_scope(action, params):
+    """Return a scheduler scope for an extension command.
+
+    Tab-scoped commands may overlap across different tabs. Commands that rely
+    on the active/focused tab, browser-global state, or capture APIs are
+    serialized through the global scope.
+    """
+    if action in _NO_SCHEDULE_ACTIONS:
+        return None
+    if action in _GLOBAL_SCOPE_ACTIONS:
+        return ("global", action)
+
+    tab_id = _coerce_tab_id((params or {}).get("tabId"))
+    if tab_id is None:
+        return ("global", action)
+    return ("tab", tab_id)
+
+
+async def _run_in_command_scope(action, params, coro_factory):
+    scope = _command_scope(action, params)
+    if scope is None:
+        return await coro_factory()
+
+    lock = _get_scope_lock(scope)
+    scope_name = f"{scope[0]}:{scope[1]}"
+    queued = True
+    _scheduler_queued[scope_name] = _scheduler_queued.get(scope_name, 0) + 1
+    try:
+        async with lock:
+            async with _scheduler_gate_lease(scope):
+                _scheduler_queued[scope_name] = max(0, _scheduler_queued.get(scope_name, 1) - 1)
+                if _scheduler_queued[scope_name] == 0:
+                    _scheduler_queued.pop(scope_name, None)
+                queued = False
+                _scheduler_active[scope_name] = action
+                try:
+                    return await coro_factory()
+                finally:
+                    _scheduler_active.pop(scope_name, None)
+    finally:
+        if queued:
+            _scheduler_queued[scope_name] = max(0, _scheduler_queued.get(scope_name, 1) - 1)
+            if _scheduler_queued[scope_name] == 0:
+                _scheduler_queued.pop(scope_name, None)
+
+
+def _cleanup_tab_scheduler_state(tab_id):
+    tab_id = _coerce_tab_id(tab_id)
+    if tab_id is None:
+        return
+    scope_name = f"tab:{tab_id}"
+    lock = _tab_command_locks.get(tab_id)
+    if (
+        lock is not None
+        and not lock.locked()
+        and scope_name not in _scheduler_active
+        and _scheduler_queued.get(scope_name, 0) == 0
+    ):
+        _tab_command_locks.pop(tab_id, None)
+
+
 def _native_click_screen(x, y):
     if not sys.platform.startswith("win"):
         return {"error": "trustedClick is only implemented on Windows"}
@@ -208,7 +464,10 @@ async def trusted_click(params):
   }});
 }})()
 """
-    result = await send_to_extension("executeJS", {"code": code})
+    js_params = {"code": code}
+    if params.get("tabId") is not None:
+        js_params["tabId"] = params.get("tabId")
+    result = await send_to_extension("executeJS", js_params)
     if "error" in result:
         return result
 
@@ -269,6 +528,7 @@ WRITE_ACTIONS = {
     "pinTab", "muteTab", "duplicateTab", "reloadTabBrowser", "goBack", "goForward",
     "setZoom", "createWindow", "closeWindow", "moveTab", "detachTab",
     "storageOp", "reloadExtension", "wakeTab", "highlight", "clearHighlight",
+    "uploadFile",
 }
 
 
@@ -576,18 +836,26 @@ def _parse_workflow(filepath, variables=None):
 # ══════════════════════════════════════════════
 
 async def ws_handler(websocket):
-    global extension_ws
-    if extension_ws is not None:
-        print(f"[{now()}] ↻ New extension connection replacing existing one")
+    global extension_ws, extension_ws_generation
+    old_ws = extension_ws
+    extension_ws_generation += 1
+    my_generation = extension_ws_generation
     extension_ws = websocket
-    print(f"[{now()}] ✅ Zen Browser extension connected")
+
+    if old_ws is not None and old_ws is not websocket:
+        _log("↻ New extension connection replacing existing one")
+        try:
+            await old_ws.close(code=1012, reason="replaced by newer ZenLink connection")
+        except Exception:
+            pass
+    _log(f"✅ Zen Browser extension connected (generation {my_generation})")
 
     try:
         async for message in websocket:
             try:
                 data = json.loads(message)
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                print(f"[{now()}] ⚠️ Bad message from extension: {e}")
+                _log(f"⚠️ Bad message from extension: {e}")
                 continue
             cmd_id = data.get("id")
 
@@ -596,25 +864,47 @@ async def ws_handler(websocket):
                 continue
 
             if cmd_id and cmd_id in pending_commands:
-                pending_commands[cmd_id].set_result(data.get("result", {}))
+                entry = pending_commands[cmd_id]
+                future = entry["future"] if isinstance(entry, dict) else entry
+                if not future.done():
+                    future.set_result(data.get("result", {}))
             else:
-                print(f"[{now()}] ← Extension: {json.dumps(data)[:200]}")
+                _log(f"← Extension: {json.dumps(data)[:200]}")
     except websockets.exceptions.ConnectionClosed:
-        print(f"[{now()}] ⚠️ Extension disconnected")
+        _log(f"⚠️ Extension disconnected (generation {my_generation})")
     finally:
-        extension_ws = None
-        # Fail all pending commands immediately instead of letting them timeout
-        for cmd_id, future in list(pending_commands.items()):
-            if not future.done():
-                future.set_result({"error": "Extension disconnected"})
-        pending_commands.clear()
+        if extension_ws is websocket:
+            extension_ws = None
+        else:
+            _log(f"↩ Stale extension connection closed (generation {my_generation}); active connection kept")
+
+        # Fail only commands that were sent over this websocket. A replaced
+        # connection must not wipe commands or connection state for the newer
+        # websocket.
+        for cmd_id, entry in list(pending_commands.items()):
+            future = entry["future"] if isinstance(entry, dict) else entry
+            ws = entry.get("ws") if isinstance(entry, dict) else websocket
+            if ws is websocket:
+                if not future.done():
+                    future.set_result({"error": "Extension disconnected"})
+                pending_commands.pop(cmd_id, None)
 
 
 async def send_to_extension(action, params=None, timeout=30):
     """Send command to extension and wait for response."""
+    return await _run_in_command_scope(
+        action,
+        params,
+        lambda: _send_to_extension_raw(action, params=params, timeout=timeout),
+    )
+
+
+async def _send_to_extension_raw(action, params=None, timeout=30):
+    """Send a command over the active extension WebSocket without scheduling."""
     global command_counter
-    
-    if not extension_ws:
+
+    ws = extension_ws
+    if not ws:
         return {"error": "Zen Browser extension not connected. Open Zen Browser and ensure the extension is loaded."}
     
     command_counter += 1
@@ -632,11 +922,22 @@ async def send_to_extension(action, params=None, timeout=30):
     }
     
     future = asyncio.get_running_loop().create_future()
-    pending_commands[cmd_id] = future
+    pending_commands[cmd_id] = {
+        "future": future,
+        "ws": ws,
+        "action": action,
+        "tabId": (params or {}).get("tabId"),
+        "started": time.time(),
+    }
     
     try:
-        await extension_ws.send(json.dumps(command))
+        async with _get_ws_send_lock():
+            if extension_ws is not ws:
+                return {"error": "Extension reconnected before command could be sent"}
+            await ws.send(json.dumps(command))
         result = await asyncio.wait_for(future, timeout=timeout)
+        if action == "closeTab" and not (isinstance(result, dict) and result.get("error")):
+            _cleanup_tab_scheduler_state((params or {}).get("tabId"))
         return result
     except asyncio.TimeoutError:
         return {"error": f"Command timed out after {timeout}s"}
@@ -646,6 +947,171 @@ async def send_to_extension(action, params=None, timeout=30):
         return {"error": str(e)}
     finally:
         pending_commands.pop(cmd_id, None)
+
+
+# ══════════════════════════════════════════════
+#  2.1.0 — File upload (zen_upload_file)
+# ══════════════════════════════════════════════
+# Pages can't read local files, so the bridge reads them and streams base64
+# chunks to the content script, which rebuilds File objects and attaches them.
+# Chunk size is a multiple of 3 so every chunk base64-decodes on its own, and
+# stays well under the websocket's 1 MiB frame limit.
+UPLOAD_CHUNK_BYTES = 384 * 1024
+UPLOAD_MAX_BYTES = 1024 * 1024 * 1024
+UPLOAD_ATTACH_JS = r"""function(parts, selector, files, mode) {
+    var toBytes = function (b64) { var bin = atob(b64), a = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return a; };
+    // 2.0.9: build the File + DataTransfer with the PAGE's own constructors when we can (Firefox content
+    // script: wrappedJSObject + cloneInto). Content-script Files were silently dropped by some uploaders
+    // (YouTube thumbnail, TikTok/Instagram covers) - page-side Files look exactly like a user pick.
+    var W = (typeof cloneInto === 'function' && window.wrappedJSObject) ? window.wrappedJSObject : null;
+    var objs = files.map(function (f) {
+      var bytes = parts.slice(f.start, f.end).map(toBytes), opts = { type: f.type || 'application/octet-stream', lastModified: Date.now() };
+      return W ? new W.File(cloneInto(bytes, W), f.name, cloneInto(opts, W)) : new File(bytes, f.name, opts);
+    });
+    var target = null;
+    if (selector) { target = document.querySelector(selector); if (!target) return { error: 'No element matches: ' + selector }; }
+    var input = null;
+    if (mode !== 'drop') {
+      if (target) input = target.matches('input[type=file]') ? target : target.querySelector('input[type=file]');
+      if (!input && (!target || mode === 'input')) input = document.querySelector('input[type=file]');
+      if (!input && mode === 'input') return { error: 'No input[type=file] found' };
+    }
+    var dt = W ? new W.DataTransfer() : new DataTransfer();
+    objs.forEach(function (f) { dt.items.add(f); });
+    var info = objs.map(function (f) { return { name: f.name, size: f.size, type: f.type }; });
+    if (input) {
+      if (!input.multiple && objs.length > 1) return { error: 'This input takes one file; got ' + objs.length };
+      if (W) input.wrappedJSObject.files = dt.files; else input.files = dt.files;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, mode: 'input', files: info, accept: input.accept || null, pageFiles: !!W };
+    }
+    var zone = target || document.body;
+    ['dragenter', 'dragover', 'drop'].forEach(function (t) {
+      if (W) {
+        var init = new W.Object(); init.bubbles = true; init.cancelable = true; init.dataTransfer = dt;
+        zone.wrappedJSObject.dispatchEvent(new W.DragEvent(t, init));
+      } else {
+        zone.dispatchEvent(new DragEvent(t, { bubbles: true, cancelable: true, dataTransfer: dt }));
+      }
+    });
+    return { ok: true, mode: 'drop', files: info, pageFiles: !!W };
+  }"""
+
+
+async def _upload_files_async(body):
+    import mimetypes
+    import uuid
+    paths = body.get("paths") or ([body["path"]] if body.get("path") else [])
+    if not paths:
+        return {"error": "path or paths is required"}
+    resolved = []
+    for p in paths:
+        p = os.path.abspath(os.path.expandvars(os.path.expanduser(str(p))))
+        if not os.path.isfile(p):
+            return {"error": f"file not found: {p}"}
+        if os.path.getsize(p) > UPLOAD_MAX_BYTES:
+            return {"error": f"file over 1 GB: {p}"}
+        resolved.append(p)
+    tab_id = _coerce_tab_id(body.get("tabId"))
+    if tab_id is None:
+        tabs = await send_to_extension("getTabs", {})
+        active = [t for t in (tabs or {}).get("tabs", []) if t.get("active")]
+        if not active:
+            return {"error": "no active tab - pass tabId"}
+        tab_id = active[0]["id"]
+    uid = uuid.uuid4().hex[:12]
+    native, files, idx, total, t0 = True, [], 0, 0, time.time()
+    for p in resolved:
+        start = idx
+        with open(p, "rb") as fh:
+            while True:
+                raw = fh.read(UPLOAD_CHUNK_BYTES)
+                if not raw:
+                    break
+                b64 = base64.b64encode(raw).decode("ascii")
+                r = None
+                if native:
+                    r = await send_to_extension("uploadChunk", {"tabId": tab_id, "uploadId": uid, "index": idx, "data": b64}, timeout=30)
+                    if isinstance(r, dict) and "Unknown action" in str(r.get("error", "")):
+                        native = False  # older extension: fall back to executeJS transport
+                if not native:
+                    code = ("((window.__zlUp=window.__zlUp||{})[%s]=window.__zlUp[%s]||[])[%d]=%s;'ok'"
+                            % (json.dumps(uid), json.dumps(uid), idx, json.dumps(b64)))
+                    r = await send_to_extension("executeJS", {"tabId": tab_id, "code": code}, timeout=30)
+                if isinstance(r, dict) and r.get("error"):
+                    return {"error": f"chunk {idx} failed: {r['error']}"}
+                idx += 1
+                total += len(raw)
+        files.append({"name": os.path.basename(p), "type": mimetypes.guess_type(p)[0] or "application/octet-stream",
+                      "start": start, "end": idx})
+    sel, mode = body.get("selector"), body.get("mode") or "auto"
+    if native:
+        r = await send_to_extension("uploadCommit", {"tabId": tab_id, "uploadId": uid, "selector": sel,
+                                                     "files": files, "mode": mode}, timeout=60)
+    else:
+        code = ("(function(){var P=(window.__zlUp||{})[%s];if(window.__zlUp)delete window.__zlUp[%s];"
+                "if(!P)return JSON.stringify({error:'upload chunks missing'});"
+                "return JSON.stringify((%s)(P,%s,%s,%s));})()"
+                % (json.dumps(uid), json.dumps(uid), UPLOAD_ATTACH_JS, json.dumps(sel), json.dumps(files), json.dumps(mode)))
+        r = await send_to_extension("executeJS", {"tabId": tab_id, "code": code}, timeout=60)
+        if isinstance(r, dict) and "result" in r:
+            try:
+                r = json.loads(r["result"])
+            except Exception:
+                r = {"error": f"unexpected commit result: {str(r['result'])[:200]}"}
+    if isinstance(r, dict) and not r.get("error"):
+        r.update({"tabId": tab_id, "chunks": idx, "bytes": total,
+                  "transport": "native" if native else "executeJS", "seconds": round(time.time() - t0, 1)})
+    return r
+
+
+JS_FULL_CHUNK = 45000   # content.js caps executeJS results at 50,000 chars
+
+
+async def _js_full_async(body):
+    """2.0.9 - /api/js with {"full": true}: run the code once, park the result in the content-script
+    window, then read it back in slices so callers get results longer than the 50 KB cap."""
+    tab_id = body.get("tabId")
+    wrapped = ("(function(){var __v=eval(%s);window.__zlBig=String(__v===undefined||__v===null?'':__v);"
+               "return String(window.__zlBig.length);})()" % json.dumps(body.get("code", "")))
+    r = await send_to_extension("executeJS", {"tabId": tab_id, "code": wrapped}, timeout=60)
+    if not isinstance(r, dict) or r.get("error") or not str(r.get("result", "")).isdigit():
+        return r if isinstance(r, dict) else {"error": "unexpected: %r" % (r,)}
+    n, parts = int(r["result"]), []
+    for i in range(0, n, JS_FULL_CHUNK):
+        rr = await send_to_extension("executeJS", {"tabId": tab_id, "code": "window.__zlBig.slice(%d,%d)" % (i, i + JS_FULL_CHUNK)}, timeout=30)
+        if not isinstance(rr, dict) or rr.get("error"):
+            return {"error": "chunk at %d failed: %r" % (i, rr)}
+        parts.append(rr.get("result", ""))
+    await send_to_extension("executeJS", {"tabId": tab_id, "code": "delete window.__zlBig;'ok'"}, timeout=10)
+    out = "".join(parts)
+    return {"result": out, "length": len(out), "chunks": len(parts), "complete": len(out) == n}
+
+
+# 2.0.9 - {"force": true} on /api/close-tab: stop "Leave page?" prompts from holding the tab open
+NEUTER_UNLOAD_JS = r"""(function(){try{
+  var W = window.wrappedJSObject || window; W.onbeforeunload = null; window.onbeforeunload = null;
+  if (typeof exportFunction === 'function' && W.BeforeUnloadEvent) {
+    Object.defineProperty(W.BeforeUnloadEvent.prototype, 'returnValue', {configurable: true,
+      get: exportFunction(function () { return ''; }, W), set: exportFunction(function () {}, W)});
+    var EP = W.Event.prototype, orig = EP.preventDefault;
+    EP.preventDefault = exportFunction(function () { if (this.type === 'beforeunload') return; return orig.call(this); }, W);
+  }
+  return 'ok';
+}catch(e){return 'err '+e;}})()"""
+
+_IMAGE_URL = _re.compile(r"^https?://[^?#]+\.(?:jpe?g|png|gif|webp|avif|bmp)(?:[?#].*)?$", _re.I)
+
+
+def _wrap_image_url(body):
+    """2.0.9 - opening a bare image URL (an ImageDocument) knocked the extension offline. Serve it inside
+    a tiny local page instead; the image is #zlimg. Pass {"raw": true} to skip."""
+    url = (body or {}).get("url") or ""
+    if url and not body.get("raw") and _IMAGE_URL.match(url):
+        from urllib.parse import quote
+        body = dict(body, url="http://127.0.0.1:%d/view?src=%s" % (HTTP_PORT, quote(url, safe="")), wrappedImage=url)
+    return body
 
 
 # ══════════════════════════════════════════════
@@ -874,6 +1340,10 @@ async def run_command(cmd):
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
+
+    def canonical_path(self):
+        path = self.path.split("?", 1)[0]
+        return _API_ALIASES.get(path, path)
     
     def do_GET(self):
         routes = {
@@ -891,12 +1361,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/api/health": self.handle_health,
             "/api/logs": self.handle_logs,
             "/api/audit": self.handle_audit,
+            "/api/scheduler": self.handle_scheduler,
             "/api/get-policy": self.handle_get_policy,
             "/api/list-sessions": self.handle_list_sessions,
             "/api/list-tags": self.handle_list_tags,
+            "/view": self.handle_view,
         }
         
-        handler = routes.get(self.path.split("?")[0])
+        handler = routes.get(self.canonical_path())
         if handler:
             handler()
         else:
@@ -911,6 +1383,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/api/scroll": self.handle_scroll,
             "/api/hover": self.handle_hover,
             "/api/fill": self.handle_fill,
+            "/api/upload-file": self.handle_upload_file,
             "/api/navigate": self.handle_navigate,
             "/api/find": self.handle_find,
             "/api/js": self.handle_js,
@@ -1007,11 +1480,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/api/health": self.handle_health,
             "/api/logs": self.handle_logs,
             "/api/audit": self.handle_audit,
+            "/api/scheduler": self.handle_scheduler,
             "/api/set-policy": self.handle_set_policy,
             "/api/get-policy": self.handle_get_policy,
         }
 
-        handler = routes.get(self.path)
+        handler = routes.get(self.canonical_path())
         if handler:
             handler()
         else:
@@ -1027,6 +1501,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "ws_port": WS_PORT,
             "screenshot_dir": SCREENSHOT_DIR,
             "bridge_version": BRIDGE_VERSION,
+            "extension_generation": extension_ws_generation,
+            "scheduler": _scheduler_snapshot(),
             "keep_alive_tabs": [tid for tid, t in _keep_alive_tasks.items() if not t.done()],
         })
     
@@ -1142,6 +1618,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
         )
         self.send_json(200, result)
     
+    def handle_upload_file(self):
+        body = self.read_body()
+        policy_err = _check_policy("uploadFile", body)
+        if policy_err:
+            self.send_json(403, policy_err)
+            return
+        _invalidate_cache_for_action("uploadFile")
+        t0 = time.time()
+        try:
+            result = self.run_async(_upload_files_async(body), timeout=float(body.get("timeout", 300)))
+        except Exception as e:
+            result = {"error": str(e)}
+        ok = isinstance(result, dict) and not result.get("error")
+        _audit("uploadFile", body, ok, None if ok else (result or {}).get("error"), (time.time() - t0) * 1000)
+        self.send_json(200, result)
+
     def handle_click(self):
         self._send_extension_action("click", self.read_body())
 
@@ -1173,7 +1665,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._send_extension_action("fill", self.read_body())
     
     def handle_navigate(self):
-        self._send_extension_action("navigate", self.read_body())
+        self._send_extension_action("navigate", _wrap_image_url(self.read_body()))
+
+    def handle_view(self):
+        """2.0.9 - local wrapper page for bare image URLs (see _wrap_image_url)."""
+        import html as _html
+        from urllib.parse import urlparse, parse_qs
+        src = parse_qs(urlparse(self.path).query).get("src", [""])[0]
+        page = ("<!doctype html><html><head><meta charset='utf-8'><title>ZenLink view</title></head>"
+                "<body style='margin:0;background:#111'><img id='zlimg' src=\"" + _html.escape(src, quote=True) +
+                "\" style='display:block;max-width:100%'></body></html>")
+        data = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
     
     def handle_find(self):
         body = self.read_body()
@@ -1184,7 +1691,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_json(200, result)
     
     def handle_js(self):
-        self._send_extension_action("executeJS", self.read_body())
+        body = self.read_body()
+        if body.get("full"):
+            try:
+                result = self.run_async(_js_full_async(body), timeout=float(body.get("timeout", 180)))
+            except Exception as e:
+                result = {"error": str(e)}
+            self.send_json(200, result)
+            return
+        self._send_extension_action("executeJS", body)
     
     def handle_highlight(self):
         self._send_extension_action("highlight", self.read_body())
@@ -1193,13 +1708,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._send_extension_action("clearHighlight", {})
 
     def handle_close_tab(self):
-        self._send_extension_action("closeTab", self.read_body())
+        body = self.read_body()
+        if body.get("force"):
+            try:
+                self.run_async(send_to_extension("executeJS", {"tabId": body.get("tabId"), "code": NEUTER_UNLOAD_JS}, timeout=8), timeout=10)
+            except Exception:
+                pass   # tab may be hung or already gone - still try to close it
+        self._send_extension_action("closeTab", body)
 
     def handle_switch_tab(self):
         self._send_extension_action("switchTab", self.read_body())
 
     def handle_new_tab(self):
-        self._send_extension_action("newTab", self.read_body())
+        self._send_extension_action("newTab", _wrap_image_url(self.read_body()))
 
     def handle_wait_for_element(self):
         body = self.read_body()
@@ -1400,8 +1921,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "bridge_version": BRIDGE_VERSION,
             "api_version": API_VERSION,
             "extension_connected": extension_ws is not None,
+            "extension_generation": extension_ws_generation,
             "ports": {"http": HTTP_PORT, "ws": WS_PORT},
             "keep_alive_tabs": active_keep_alive,
+            "scheduler": _scheduler_snapshot(),
             "tab_pool": _pool_status(),
             "tags": dict(_tags),
             "policy": dict(_policy),
@@ -1426,6 +1949,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         since = int(body.get("since", 0))
         items = [a for a in _audit_log if a["ts"] >= since][-limit:]
         self.send_json(200, {"count": len(items), "entries": items, "total": len(_audit_log)})
+
+    def handle_scheduler(self):
+        self.send_json(200, _scheduler_snapshot())
 
     def handle_set_policy(self):
         body = self.read_body()
@@ -1570,11 +2096,13 @@ async def main():
     loop = asyncio.get_running_loop()
     
     # Start WebSocket server
-    ws_server = await ws_serve(ws_handler, "127.0.0.1", WS_PORT)
+    # 2.1.0: websockets defaults to a 1 MiB message cap - a full-page screenshot is several MB and the
+    # oversized frame closed the socket ("Extension disconnected"). Allow big frames.
+    ws_server = await ws_serve(ws_handler, "127.0.0.1", WS_PORT, max_size=256 * 1024 * 1024)
     print(f"[{now()}] 🔌 WebSocket server on ws://localhost:{WS_PORT}")
     
     # Start HTTP server in thread
-    http_server = HTTPServer(("127.0.0.1", HTTP_PORT), BridgeHandler)
+    http_server = ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), BridgeHandler)
     http_thread = Thread(target=http_server.serve_forever, daemon=True)
     http_thread.start()
     print(f"[{now()}] 🌐 HTTP API server on http://localhost:{HTTP_PORT}")

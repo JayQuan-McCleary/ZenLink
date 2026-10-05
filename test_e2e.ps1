@@ -31,7 +31,7 @@ function Skip($name, $why) {
 
 # === Bridge-only orchestration ===
 Write-Host "`n== Bridge-only orchestration ==" -ForegroundColor Cyan
-Test 'health'           (Hit '/api/health' $null)            { param($r) $r.bridge_version -eq '1.4.0' -and $r.extension_connected }
+Test 'health'           (Hit '/api/health' $null)            { param($r) ([version]$r.bridge_version -ge [version]'2.0.0') -and $r.extension_connected }
 Test 'get-policy'       (Hit '/api/get-policy' $null)        { param($r) $r.PSObject.Properties.Name -contains 'allow' }
 Test 'set-policy'       (Hit '/api/set-policy' @{ deny=@('evil') })   { param($r) $r.policy.deny -contains 'evil' }
 Test 'get-policy after' (Hit '/api/get-policy' $null)        { param($r) $r.deny -contains 'evil' }
@@ -54,7 +54,7 @@ $tabId = $open.tabId
 Start-Sleep -Seconds 2
 Test 'page-info GET (active tab)' (Hit '/api/page-info' $null 'GET') { param($r) $r.url -ne $null }
 Test 'page-info POST (specific tab)' (Hit '/api/page-info' @{ tabId=$tabId }) { param($r) $r.title -match 'Example' }
-Test 'wait-for-element h1' (Hit '/api/wait-for-element' @{ selector='h1'; timeout=8000; tabId=$tabId } 'POST' 20) { param($r) $r.found }
+Test 'wait-for-element p' (Hit '/api/wait-for-element' @{ selector='p'; timeout=8000; tabId=$tabId } 'POST' 20) { param($r) $r.found }
 
 # Close test tab
 $null = Hit '/api/close-tab' @{ tabId=$tabId }
@@ -73,7 +73,7 @@ Write-Host "`n== 1.4.0 extension feature probes ==" -ForegroundColor Cyan
 $t = Hit '/api/new-tab' @{ url='https://example.com' }
 $tid = $t.tabId
 Start-Sleep -Seconds 3
-$null = Hit '/api/wait-for-element' @{ selector='h1'; tabId=$tid; timeout=10000 }
+$null = Hit '/api/wait-for-element' @{ selector='p'; tabId=$tid; timeout=10000 }
 
 $probe = Hit '/api/iframes' @{ tabId=$tid }
 $ext14 = -not ($probe.error -match 'Unknown action')
@@ -85,15 +85,15 @@ if (-not $ext14) {
 
   Test 'query basic'      (Hit '/api/query' @{ selector='p'; tabId=$tid })  { param($r) $r.items.Count -ge 1 }
   Test 'query fields'     (Hit '/api/query' @{ selector='a'; tabId=$tid; fields=@('text','href','bounds') })  { param($r) $r.items[0].href -ne $null }
-  Test 'html'             (Hit '/api/html' @{ selector='h1'; tabId=$tid })  { param($r) $r.html -match 'h1' }
+  Test 'html'             (Hit '/api/html' @{ selector='p'; tabId=$tid })  { param($r) $r.html -match '<p' }
   Test 'links'            (Hit '/api/links' @{ tabId=$tid })                { param($r) $r.count -ge 1 }
   Test 'images'           (Hit '/api/images' @{ tabId=$tid })               { param($r) $r.PSObject.Properties.Name -contains 'images' }
   Test 'meta'             (Hit '/api/meta' @{ tabId=$tid })                 { param($r) $r.title -eq 'Example Domain' }
   Test 'structured-data'  (Hit '/api/structured-data' @{ tabId=$tid })      { param($r) $r.PSObject.Properties.Name -contains 'jsonld' }
-  Test 'bounds'           (Hit '/api/bounds' @{ selector='h1'; tabId=$tid }) { param($r) $r.width -gt 0 }
-  Test 'computed-style'   (Hit '/api/computed-style' @{ selector='h1'; tabId=$tid })  { param($r) $r.computed.color -ne $null }
+  Test 'bounds'           (Hit '/api/bounds' @{ selector='p'; tabId=$tid }) { param($r) $r.width -gt 0 }
+  Test 'computed-style'   (Hit '/api/computed-style' @{ selector='p'; tabId=$tid })  { param($r) $r.computed.color -ne $null }
   Test 'readability'      (Hit '/api/readability' @{ tabId=$tid })          { param($r) $r.title -match 'Example' -and $r.textContent.Length -gt 50 }
-  Test 'markdown'         (Hit '/api/markdown' @{ tabId=$tid })             { param($r) $r.markdown -match '#' }
+  Test 'markdown'         (Hit '/api/markdown' @{ tabId=$tid })             { param($r) $r.markdown -match 'documentation' }
   Test 'full-page-metrics' (Hit '/api/full-page-metrics' @{ tabId=$tid })  { param($r) $r.docWidth -gt 0 }
   Test 'explain-selector' (Hit '/api/explain-selector' @{ selector='p'; tabId=$tid }) { param($r) $r.matches -ge 0 }
   Test 'watch-console on' (Hit '/api/watch-console' @{ enabled=$true; tabId=$tid })   { param($r) $r.enabled }
@@ -109,10 +109,10 @@ if (-not $ext14) {
   Test 'storage local snapshot' (Hit '/api/storage' @{ kind='local'; op='snapshot'; tabId=$tid })  { param($r) $r.items.zk_test -eq 'hello' }
   Test 'storage local clear' (Hit '/api/storage' @{ kind='local'; op='clear'; tabId=$tid })  { param($r) $r.ok }
 
-  Test 'focus h1'  (Hit '/api/focus' @{ selector='h1'; tabId=$tid })  { param($r) $r.ok }
+  Test 'focus p'  (Hit '/api/focus' @{ selector='p'; tabId=$tid })  { param($r) $r.ok }
   Test 'blur'      (Hit '/api/blur' @{ tabId=$tid })                  { param($r) $r.ok }
   Test 'keypress Tab' (Hit '/api/keypress' @{ key='Tab'; tabId=$tid })  { param($r) $r.ok }
-  Test 'double-click h1' (Hit '/api/double-click' @{ selector='h1'; tabId=$tid })  { param($r) $r.ok }
+  Test 'double-click p' (Hit '/api/double-click' @{ selector='p'; tabId=$tid })  { param($r) $r.ok }
   Test 'drag (no targets, expect error)' (Hit '/api/drag' @{ from='#nope-a'; to='#nope-b'; tabId=$tid }) 'expectError'
 
   # Tab management
@@ -141,7 +141,7 @@ if (-not $ext14) {
   Test 'intercept clear' (Hit '/api/intercept' @{ op='clear' })           { param($r) $r.rules -eq 0 }
 
   # Element + full-page screenshot (heavier — but we said thorough)
-  Test 'element-screenshot' (Hit '/api/element-screenshot' @{ selector='h1'; tabId=$tid } 'POST' 30)  { param($r) $r.dataUrl -ne $null }
+  Test 'element-screenshot' (Hit '/api/element-screenshot' @{ selector='p'; tabId=$tid } 'POST' 30)  { param($r) $r.dataUrl -ne $null }
   Test 'full-page-screenshot' (Hit '/api/full-page-screenshot' @{ tabId=$tid } 'POST' 90)  { param($r) $r.dataUrl -ne $null }
 
   # Orchestration with real tabs
@@ -166,6 +166,7 @@ if (-not $ext14) {
   Test 'tab-pool shrink' (Hit '/api/tab-pool' @{ size=0; url='about:blank' })  { param($r) $r.size -eq 0 }
 
   # Cleanup
+  $null = Hit '/api/untag-tab' @{ name='example' }
   $null = Hit '/api/close-tab' @{ tabId=$tid }
   $null = Hit '/api/close-tab' @{ tabId=$tid2 }
 }

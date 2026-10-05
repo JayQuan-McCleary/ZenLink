@@ -3,7 +3,7 @@
 
 (function() {
   'use strict';
-  const CONTENT_VERSION = 14;
+  const CONTENT_VERSION = 16;
   if (window.__claudeBridgeVersion >= CONTENT_VERSION) return;
   window.__claudeBridgeVersion = CONTENT_VERSION;
 
@@ -70,6 +70,10 @@
       'getIframes':            () => getIframes(),
       'explainSelector':       () => explainSelector(msg.selector),
       'fullPageMetrics':       () => fullPageMetrics(),
+      // ── 2.1.0 file upload ──
+      'uploadChunk':           () => uploadChunk(msg.uploadId, msg.index, msg.data),
+      'uploadCommit':          () => uploadCommit(msg.uploadId, msg.selector, msg.files, msg.mode),
+      'uploadAbort':           () => uploadAbort(msg.uploadId),
     };
 
     // Only respond if we're the latest version
@@ -90,6 +94,61 @@
     }
     return false;
   });
+
+  // ── File upload (2.1.0) ──
+  // The bridge reads the file from disk and streams it here as independently
+  // decodable base64 chunks; commit rebuilds real File objects and attaches
+  // them to an <input type=file> (or drops them on a drop zone).
+  const __zlUploads = {};
+  function uploadChunk(id, index, data) {
+    (__zlUploads[id] = __zlUploads[id] || [])[index] = data;
+    return { ok: true, index };
+  }
+  function uploadAbort(id) { delete __zlUploads[id]; return { ok: true }; }
+  function uploadCommit(id, selector, files, mode) {
+    const parts = __zlUploads[id];
+    delete __zlUploads[id];
+    if (!parts) return { error: 'upload ' + id + ' not found (chunks never arrived)' };
+    return __zlAttachFiles(parts, selector, files, mode);
+  }
+  const __zlAttachFiles = function(parts, selector, files, mode) {
+    var toBytes = function (b64) { var bin = atob(b64), a = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return a; };
+    // 2.1.0: build the File + DataTransfer with the PAGE's own constructors (wrappedJSObject + cloneInto).
+    // Content-script Files were silently dropped by some uploaders (YouTube thumbnails, TikTok/Instagram covers).
+    var W = (typeof cloneInto === 'function' && window.wrappedJSObject) ? window.wrappedJSObject : null;
+    var objs = files.map(function (f) {
+      var bytes = parts.slice(f.start, f.end).map(toBytes), opts = { type: f.type || 'application/octet-stream', lastModified: Date.now() };
+      return W ? new W.File(cloneInto(bytes, W), f.name, cloneInto(opts, W)) : new File(bytes, f.name, opts);
+    });
+    var target = null;
+    if (selector) { target = document.querySelector(selector); if (!target) return { error: 'No element matches: ' + selector }; }
+    var input = null;
+    if (mode !== 'drop') {
+      if (target) input = target.matches('input[type=file]') ? target : target.querySelector('input[type=file]');
+      if (!input && (!target || mode === 'input')) input = document.querySelector('input[type=file]');
+      if (!input && mode === 'input') return { error: 'No input[type=file] found' };
+    }
+    var dt = W ? new W.DataTransfer() : new DataTransfer();
+    objs.forEach(function (f) { dt.items.add(f); });
+    var info = objs.map(function (f) { return { name: f.name, size: f.size, type: f.type }; });
+    if (input) {
+      if (!input.multiple && objs.length > 1) return { error: 'This input takes one file; got ' + objs.length };
+      if (W) input.wrappedJSObject.files = dt.files; else input.files = dt.files;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, mode: 'input', files: info, accept: input.accept || null, pageFiles: !!W };
+    }
+    var zone = target || document.body;
+    ['dragenter', 'dragover', 'drop'].forEach(function (t) {
+      if (W) {
+        var init = new W.Object(); init.bubbles = true; init.cancelable = true; init.dataTransfer = dt;
+        zone.wrappedJSObject.dispatchEvent(new W.DragEvent(t, init));
+      } else {
+        zone.dispatchEvent(new DragEvent(t, { bubbles: true, cancelable: true, dataTransfer: dt }));
+      }
+    });
+    return { ok: true, mode: 'drop', files: info, pageFiles: !!W };
+  };
 
   // ── Page Info ──
   function getPageInfo() {
@@ -577,7 +636,7 @@
   }
 
   // ── Execute JS ──
-  const JS_RESULT_LIMIT = 50000; // 50KB cap to avoid blowing up WebSocket
+  const JS_RESULT_LIMIT = 8000000; // 2.1.0: bridge WebSocket now takes up to 256 MB (was 50 KB under the old 1 MB socket limit)
 
   function executeJS(code) {
     try {

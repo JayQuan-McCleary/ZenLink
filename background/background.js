@@ -3,7 +3,7 @@
 
 'use strict';
 
-const EXPECTED_CONTENT_VERSION = 14;
+const EXPECTED_CONTENT_VERSION = 16;
 const WS_URL = 'ws://127.0.0.1:8766';
 let ws = null;
 let reconnectTimer = null;
@@ -240,6 +240,9 @@ async function handleCommand(command) {
     case 'getIframes':
     case 'explainSelector':
     case 'fullPageMetrics':
+    case 'uploadChunk':
+    case 'uploadCommit':
+    case 'uploadAbort':
       return await forwardToContent(action, params);
 
     default:
@@ -593,75 +596,124 @@ async function restoreTabAfterCapture(previousTabId) {
 }
 
 // ── Element / full-page screenshot ──
+// 2.1.0: shared helpers for stitched captures
+const CANVAS_MAX = 32000;   // Firefox canvas dimension limit is 32767
+const zlSleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function zlEval(tabId, code) {
+  const r = await forwardToContent('executeJS', { tabId, code });
+  return r && !r.error ? r.result : null;
+}
+
+// Hide position:fixed / sticky elements (headers, cookie bars) so they don't repeat in every stitched
+// segment. Elements that contain the capture target are left alone.
+async function zlHideFixed(tabId, selector) {
+  await zlEval(tabId, `(()=>{const t=${selector ? `document.querySelector(${JSON.stringify(selector)})` : 'null'};
+    let n=0;document.querySelectorAll('body *').forEach(e=>{const s=getComputedStyle(e);
+      if((s.position==='fixed'||s.position==='sticky')&&!(t&&e.contains(t))&&s.visibility!=='hidden'){
+        e.setAttribute('data-zl-fixed',e.style.visibility||'');e.style.visibility='hidden';n++;}});return String(n);})()`);
+}
+
+async function zlRestoreFixed(tabId) {
+  await zlEval(tabId, `(()=>{document.querySelectorAll('[data-zl-fixed]').forEach(e=>{e.style.visibility=e.getAttribute('data-zl-fixed');e.removeAttribute('data-zl-fixed');});return '1';})()`);
+}
+
 async function elementScreenshot(tabId, selector) {
-  let previousTabId = null;
+  let previousTabId = null, hidFixed = false, id = null;
   try {
-    const id = tabId || (await getActiveTabId());
+    id = tabId || (await getActiveTabId());
     if (!id || !selector) return { error: 'tabId and selector required' };
     const tab = await browser.tabs.get(id);
     if (isRestrictedUrl(tab.url)) return { error: 'Cannot access browser internal page' };
     ({ previousTabId } = await activateTabForCapture(id));
-    const bounds = await forwardToContent('getBounds', { tabId: id, selector });
-    if (bounds.error) return bounds;
-    // Scroll element into view first
-    await forwardToContent('scroll', { tabId: id, direction: 'top' });
-    await forwardToContent('executeJS', {
-      tabId: id,
-      code: `(()=>{const e=document.querySelector(${JSON.stringify(selector)}); if(e)e.scrollIntoView({block:'center',inline:'center',behavior:'instant'}); return e?.getBoundingClientRect();})()`,
-    });
-    // Take a viewport screenshot
-    const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-    // Get fresh bounds after scroll
-    const b2 = await forwardToContent('getBounds', { tabId: id, selector });
-    const dpr = b2.viewport?.dpr || 1;
-    // Crop using OffscreenCanvas (extension context)
-    const img = await loadDataUrl(dataUrl);
-    const canvas = new OffscreenCanvas(Math.round(b2.width), Math.round(b2.height));
+    const sel = JSON.stringify(selector);
+    const measure = async () => {
+      const r = await zlEval(id, `(()=>{const e=document.querySelector(${sel});if(!e)return '';const b=e.getBoundingClientRect();
+        return JSON.stringify({x:b.left,y:b.top,w:b.width,h:b.height,vw:innerWidth,vh:innerHeight,sy:scrollY,dpr:devicePixelRatio||1});})()`);
+      return r ? JSON.parse(r) : null;
+    };
+    let m = await measure();
+    if (!m) return { error: 'No element matches: ' + selector };
+    if (m.w < 1 || m.h < 1) return { error: 'Element has no size: ' + selector };
+    const tall = m.h > m.vh;
+    await zlEval(id, `(()=>{const e=document.querySelector(${sel});e.scrollIntoView({block:'${tall ? 'start' : 'center'}',inline:'center',behavior:'instant'});return '1';})()`);
+    await zlSleep(150);
+    m = await measure();
+    const W = Math.max(1, Math.round(Math.min(m.w, CANVAS_MAX))), H = Math.max(1, Math.round(Math.min(m.h, CANVAS_MAX)));
+    const canvas = new OffscreenCanvas(W, H);
     const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, Math.round(b2.x * dpr), Math.round(b2.y * dpr), Math.round(b2.width * dpr), Math.round(b2.height * dpr), 0, 0, Math.round(b2.width), Math.round(b2.height));
+    let covered = 0, segments = 0;
+    // 2.1.0: elements taller than the viewport are scrolled and stitched (they used to come back blank below the fold)
+    for (let guard = 0; guard < 60 && covered < H; guard++) {
+      const img = await loadDataUrl(await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' }));
+      const d = m.dpr;
+      const visTop = Math.max(0, m.y), visBot = Math.min(m.vh, m.y + m.h);
+      const srcTop = Math.max(visTop, m.y + covered);
+      const sx = Math.max(0, m.x), sw = Math.min(m.vw, m.x + m.w) - sx;
+      if (visBot > srcTop && sw > 0) {
+        ctx.drawImage(img, sx * d, srcTop * d, sw * d, (visBot - srcTop) * d, sx - m.x, srcTop - m.y, sw, visBot - srcTop);
+        covered = visBot - m.y;
+        segments++;
+      }
+      if (covered >= H) break;
+      if (!hidFixed) { await zlHideFixed(id, selector); hidFixed = true; }
+      const before = m.sy;
+      await zlEval(id, `window.scrollBy(0, ${Math.max(50, Math.floor(m.vh * 0.85))}); '1'`);
+      await zlSleep(160);
+      m = await measure();
+      if (!m || m.sy === before) break;   // can't scroll any further
+    }
     const blob = await canvas.convertToBlob({ type: 'image/png' });
-    const buf = await blob.arrayBuffer();
-    const cropped = arrayBufferToDataUrl(buf, 'image/png');
-    return { ok: true, selector, bounds: { x: b2.x, y: b2.y, width: b2.width, height: b2.height }, dataUrl: cropped };
+    const cropped = arrayBufferToDataUrl(await blob.arrayBuffer(), 'image/png');
+    return { ok: true, selector, bounds: { x: m.x, y: m.y, width: W, height: H }, segments, complete: covered >= H - 1, dataUrl: cropped };
   } catch (e) { return { error: 'elementScreenshot failed: ' + e.message }; }
-  finally { await restoreTabAfterCapture(previousTabId); }
+  finally {
+    if (hidFixed && id) { try { await zlRestoreFixed(id); } catch (e) {} }
+    await restoreTabAfterCapture(previousTabId);
+  }
 }
 
 async function fullPageScreenshot(tabId) {
-  let previousTabId = null;
+  let previousTabId = null, hidFixed = false, id = null;
   try {
-    const id = tabId || (await getActiveTabId());
+    id = tabId || (await getActiveTabId());
     if (!id) return { error: 'No tab' };
     const tab = await browser.tabs.get(id);
     if (isRestrictedUrl(tab.url)) return { error: 'Cannot access browser internal page' };
     ({ previousTabId } = await activateTabForCapture(id));
     const m = await forwardToContent('fullPageMetrics', { tabId: id });
     if (m.error) return m;
+    const vh = m.viewportHeight, vw = m.viewportWidth;
+    const docH = Math.min(m.docHeight, CANVAS_MAX), docW = Math.min(Math.max(m.docWidth, 1), CANVAS_MAX);
     const segments = [];
     let y = 0;
-    const guard = 30; // Max 30 viewports tall
-    let i = 0;
-    while (y < m.docHeight && i < guard) {
-      await forwardToContent('executeJS', { tabId: id, code: `window.scrollTo(0, ${y}); 1` });
-      await new Promise(r => setTimeout(r, 120)); // Let lazy content settle
-      const data = await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-      segments.push({ y, data });
-      y += m.viewportHeight;
-      i++;
+    for (let i = 0; i < 40 && y < docH; i++) {
+      await zlEval(id, `window.scrollTo(0, ${y}); '1'`);
+      await zlSleep(150);   // let lazy content settle
+      const sy = Number(await zlEval(id, 'String(scrollY)')) || 0;   // the page may clamp the last scroll
+      segments.push({ y: sy, data: await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' }) });
+      if (!hidFixed) { await zlHideFixed(id, null); hidFixed = true; }
+      if (sy + vh >= docH) break;
+      y = sy + vh;
     }
-    // Stitch with OffscreenCanvas
-    const canvas = new OffscreenCanvas(Math.round(m.docWidth), Math.round(m.docHeight));
+    const canvas = new OffscreenCanvas(Math.round(Math.min(Math.max(docW, vw), CANVAS_MAX)), Math.round(docH));
     const ctx = canvas.getContext('2d');
     for (const seg of segments) {
       const img = await loadDataUrl(seg.data);
-      const drawH = Math.min(m.viewportHeight, m.docHeight - seg.y);
-      ctx.drawImage(img, 0, 0, img.width, drawH * (img.height / m.viewportHeight), 0, seg.y, img.width, drawH);
+      const scale = img.width / vw;   // device pixels per CSS pixel (2.1.0: was ignored -> cropped on HiDPI)
+      const drawH = Math.min(vh, docH - seg.y);
+      if (drawH <= 0) continue;
+      ctx.drawImage(img, 0, 0, img.width, drawH * scale, 0, seg.y, vw, drawH);
     }
     const blob = await canvas.convertToBlob({ type: 'image/png' });
     const buf = await blob.arrayBuffer();
-    return { ok: true, width: m.docWidth, height: m.docHeight, segments: segments.length, dataUrl: arrayBufferToDataUrl(buf, 'image/png') };
+    return { ok: true, width: canvas.width, height: canvas.height, segments: segments.length,
+             truncated: m.docHeight > CANVAS_MAX, dataUrl: arrayBufferToDataUrl(buf, 'image/png') };
   } catch (e) { return { error: 'fullPageScreenshot failed: ' + e.message }; }
-  finally { await restoreTabAfterCapture(previousTabId); }
+  finally {
+    if (hidFixed && id) { try { await zlRestoreFixed(id); } catch (e) {} }
+    await restoreTabAfterCapture(previousTabId);
+  }
 }
 
 async function loadDataUrl(dataUrl) {

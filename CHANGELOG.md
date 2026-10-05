@@ -1,5 +1,76 @@
 # Changelog
 
+## 2.1.0
+
+Extension + bridge release. Everything below was verified against a temporary Zen profile (75/75 e2e) and in
+real use filling TikTok / YouTube / Instagram / Threads / X / Bluesky upload pages.
+
+### Uploads
+- Native chunked uploads (`uploadChunk` / `uploadCommit` content actions, `/api/upload-file`, MCP
+  `zen_upload_file`): files stream into the page in 384 KB chunks, so local files of any size (up to 1 GB) can
+  be attached without the OS file picker. Older extensions fall back to an executeJS transport.
+- Uploaded Files and the DataTransfer are now built with the **page's own constructors**
+  (`window.wrappedJSObject` + `cloneInto`) in both transports, for `input` and `drop` modes. Content-script
+  Files were silently ignored by some uploaders (YouTube thumbnail, TikTok/Instagram cover inputs).
+  Responses include `pageFiles: true`.
+
+### Screenshots
+- **Fixed: `fullPageScreenshot` disconnected the extension.** The bridge's WebSocket used the websockets
+  library's 1 MiB default message cap; a full-page PNG is several MB. The cap is now 256 MB.
+- `elementScreenshot` now scrolls and stitches elements taller than the viewport (they came back blank below
+  the fold). Response adds `segments` and `complete`.
+- `fullPageScreenshot` scales device-pixel-ratio captures correctly (was cropped on HiDPI), aligns the last
+  segment when the page clamps the final scroll, and hides fixed/sticky headers after the first segment so they
+  don't repeat. Canvas is capped at 32000 px (`truncated: true` when the page is taller).
+
+### Bridge API
+- `/api/js` result cap raised from 50 KB to 8 MB (content.js `JS_RESULT_LIMIT`). `{"full": true}` reads
+  results of any size back in slices (works with older extensions too).
+- `/api/close-tab` `{"force": true}` disarms beforeunload ("Leave page?") prompts before closing - plain closes
+  timed out on upload pages.
+- Bare image URLs passed to `new-tab` / `navigate` open inside a local wrapper page (`/view?src=`, image is
+  `#zlimg`) instead of an ImageDocument, which knocked the extension offline. `{"raw": true}` opts out.
+- Concurrency hardening (previously unreleased 2.0.5 - 2.0.8 bridge builds):
+
+  - Bumped the bridge runtime version to `2.0.8`.
+  - Changed the scheduler from independent tab/global locks to a shared/exclusive
+    gate: tab-scoped commands still overlap across tabs, while global actions
+    wait for active tab commands and block new tab work until complete.
+  - Added scheduler gate state to `/api/scheduler`, `/api/status`, and
+    `/api/health`, and clean up idle tab lock state after successful tab closes.
+  - Bumped the bridge runtime version to `2.0.7`.
+  - Added scheduler queue visibility: `/api/scheduler`, `/api/status`, and
+    `/api/health` now report queued command counts per tab/global scope, not just
+    active commands already sent to the extension.
+  - Added `test_scheduler.ps1`, a focused live regression test for camelCase route
+    aliases, cross-tab overlap, and same-tab queue reporting.
+  - Updated the broad `test_e2e.ps1` health assertion so current 2.x bridge
+    builds do not fail a stale `1.4.0` version check.
+  - Updated `test_e2e.ps1` cleanup so its temporary `example` tab tag is removed
+    after the orchestration checks.
+  - Bumped the bridge runtime version to `2.0.6`.
+  - Added camelCase HTTP route aliases for common agent guesses such as
+    `/api/pageInfo`, `/api/pageText`, `/api/executeJS`, `/api/waitForElement`,
+    and the other multi-word API routes.
+  - Bumped the bridge runtime version to `2.0.5` for this concurrency hardening
+    build. The browser extension manifest remains `2.0.4` until a packaged
+    extension release is cut.
+  - Hardened concurrent multi-agent use:
+    - Replaced the single-threaded HTTP server with `ThreadingHTTPServer` so
+      multiple MCP/client requests can wait independently.
+    - Added bridge-side scheduling with per-tab command locks and a global lock
+      for active-tab/capture/browser-global actions.
+    - Serialized WebSocket sends to the browser extension while still allowing
+      independent tab-scoped commands to overlap.
+    - Fixed a reconnect race where a stale extension WebSocket could clear a
+      newer live connection and make the bridge report "extension not connected".
+    - Added scheduler state to `/api/status`, `/api/health`, and `/api/scheduler`.
+  - Fixed `trustedClick` selector lookup to honor `tabId` before calculating
+    viewport/screen coordinates.
+
+### Tests
+- `test_e2e.ps1`: example.com no longer has an `<h1>`, so the 8 element tests target its `<p>` instead.
+
 ## 2.0.4
 
 - Metadata-only listed AMO submission build.
