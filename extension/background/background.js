@@ -184,7 +184,7 @@ async function handleCommand(command) {
     case 'focusWindow':      return await focusWindow(params.windowId);
     case 'moveTab':          return await moveTabAction(params.tabId, params.windowId, params.index);
     case 'detachTab':        return await detachTab(params.tabId);
-    case 'elementScreenshot':return await elementScreenshot(params.tabId, params.selector);
+    case 'elementScreenshot':return await elementScreenshot(params.tabId, params.selector, params.scale);
     case 'fullPageScreenshot': return await fullPageScreenshot(params.tabId);
     case 'cookies':          return await cookiesOp(params.op, params.url, params.name, params.value, params.domain, params.path, params.secure);
     case 'clipboard':        return await clipboardOp(params.op, params.text);
@@ -618,8 +618,11 @@ async function zlRestoreFixed(tabId) {
   await zlEval(tabId, `(()=>{document.querySelectorAll('[data-zl-fixed]').forEach(e=>{e.style.visibility=e.getAttribute('data-zl-fixed');e.removeAttribute('data-zl-fixed');});return '1';})()`);
 }
 
-async function elementScreenshot(tabId, selector) {
+// 2.1.1: scale (1-4) = output pixels per CSS pixel. captureVisibleTab renders the viewport at that scale, so
+// scale 2 gives a genuinely sharper image (text in article screenshots), not an upscale. Default 1 = old size.
+async function elementScreenshot(tabId, selector, scale) {
   let previousTabId = null, hidFixed = false, id = null;
+  const want = Math.min(Math.max(Number(scale) || 1, 1), 4);
   try {
     id = tabId || (await getActiveTabId());
     if (!id || !selector) return { error: 'tabId and selector required' };
@@ -639,23 +642,27 @@ async function elementScreenshot(tabId, selector) {
     await zlEval(id, `(()=>{const e=document.querySelector(${sel});e.scrollIntoView({block:'${tall ? 'start' : 'center'}',inline:'center',behavior:'instant'});return '1';})()`);
     await zlSleep(150);
     m = await measure();
-    const W = Math.max(1, Math.round(Math.min(m.w, CANVAS_MAX))), H = Math.max(1, Math.round(Math.min(m.h, CANVAS_MAX)));
+    const cssW = Math.min(m.w, CANVAS_MAX / want), cssH = Math.min(m.h, CANVAS_MAX / want);
+    const W = Math.max(1, Math.round(cssW * want)), H = Math.max(1, Math.round(cssH * want));
     const canvas = new OffscreenCanvas(W, H);
     const ctx = canvas.getContext('2d');
+    const shot = want > 1 ? { format: 'png', scale: want } : { format: 'png' };
     let covered = 0, segments = 0;
     // 2.1.0: elements taller than the viewport are scrolled and stitched (they used to come back blank below the fold)
-    for (let guard = 0; guard < 60 && covered < H; guard++) {
-      const img = await loadDataUrl(await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' }));
-      const d = m.dpr;
+    for (let guard = 0; guard < 60 && covered < cssH; guard++) {
+      const img = await loadDataUrl(await browser.tabs.captureVisibleTab(tab.windowId, shot));
+      const d = img.width / m.vw;          // captured pixels per CSS pixel (dpr, or the requested scale)
+      const o = W / cssW;                  // output pixels per CSS pixel
       const visTop = Math.max(0, m.y), visBot = Math.min(m.vh, m.y + m.h);
       const srcTop = Math.max(visTop, m.y + covered);
       const sx = Math.max(0, m.x), sw = Math.min(m.vw, m.x + m.w) - sx;
       if (visBot > srcTop && sw > 0) {
-        ctx.drawImage(img, sx * d, srcTop * d, sw * d, (visBot - srcTop) * d, sx - m.x, srcTop - m.y, sw, visBot - srcTop);
+        ctx.drawImage(img, sx * d, srcTop * d, sw * d, (visBot - srcTop) * d,
+                      (sx - m.x) * o, (srcTop - m.y) * o, sw * o, (visBot - srcTop) * o);
         covered = visBot - m.y;
         segments++;
       }
-      if (covered >= H) break;
+      if (covered >= cssH) break;
       if (!hidFixed) { await zlHideFixed(id, selector); hidFixed = true; }
       const before = m.sy;
       await zlEval(id, `window.scrollBy(0, ${Math.max(50, Math.floor(m.vh * 0.85))}); '1'`);
@@ -665,7 +672,8 @@ async function elementScreenshot(tabId, selector) {
     }
     const blob = await canvas.convertToBlob({ type: 'image/png' });
     const cropped = arrayBufferToDataUrl(await blob.arrayBuffer(), 'image/png');
-    return { ok: true, selector, bounds: { x: m.x, y: m.y, width: W, height: H }, segments, complete: covered >= H - 1, dataUrl: cropped };
+    return { ok: true, selector, bounds: { x: m.x, y: m.y, width: W, height: H }, scale: want, segments,
+             complete: covered >= cssH - 1, dataUrl: cropped };
   } catch (e) { return { error: 'elementScreenshot failed: ' + e.message }; }
   finally {
     if (hidFixed && id) { try { await zlRestoreFixed(id); } catch (e) {} }

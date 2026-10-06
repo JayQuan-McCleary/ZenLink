@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.1
+
+Extension-only release (bridge unchanged at 2.1.0). Verified on a temporary Zen profile: 75/75 e2e.
+
+### Screenshots
+- `elementScreenshot` takes an optional `scale` (1-4, default 1): `POST /api/element-screenshot
+  {"selector": "...", "scale": 2}`. The viewport is rendered at that scale (`captureVisibleTab` `scale`), so
+  `scale: 2` returns a genuinely sharper PNG at twice the CSS size - text in article screenshots stays crisp
+  when it's enlarged - instead of an upscale. Tall elements are still scrolled and stitched at the new scale.
+- The capture now reads the real pixels-per-CSS-pixel from the captured image instead of assuming
+  `devicePixelRatio`.
+
 ## 2.1.0
 
 Extension + bridge release. Everything below was verified against a temporary Zen profile (75/75 e2e) and in
