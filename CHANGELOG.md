@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.1.2
+
+Bridge release. The extension code hasn't changed; its version moves to 2.1.2 so the signed xpi matches the
+release. Tested on a temporary Zen profile at 80%, 100% and 125% zoom (30/30 trusted-click checks, 3/3
+window/tab guard checks) plus 75/75 e2e.
+
+### Trusted click
+- **Fixed: `trustedClick` missed on zoomed pages.** Viewport coordinates were converted to screen coordinates
+  without `devicePixelRatio`, which in Zen/Firefox includes page zoom. On a tab at 80% zoom, a Save button at
+  screen (1186, 331) got clicked at (1484, 414). Nothing happened and the call still returned `ok`. The mapping
+  is now `screen = (mozInnerScreenX + clientX) * devicePixelRatio`, same for Y. After the fix the click lands
+  within 0.5 CSS px of the target at 80%, 100% and 125%.
+- The bridge process is per-monitor DPI aware now, so screen coordinates are physical pixels on scaled Windows
+  displays too. `coordinateSpace: "screen"` means physical desktop pixels.
+- The result reports what actually happened. Before the click the bridge records the element under the point
+  (`elementAtPoint`, `hit`). After the click it reads back the first trusted pointer event the page got
+  (`landed`: element, client point, and `dx`/`dy` from the intended point). `verified` is true or false, or null
+  when it can't be known (the click navigated away, or the point is over an iframe). A confirmed miss returns
+  `ok: false` with an `error`, and `clicked` says whether the OS click was sent at all.
+- It won't click into the wrong window anymore. If the tab is hidden (a background tab, or a minimized or covered
+  window), or the window under the screen point isn't the browser window showing the page, the call returns
+  `ok: false, clicked: false` without clicking. `focus: true` now actually brings the window forward first. It
+  attaches to the foreground thread, because Windows usually refused a plain SetForegroundWindow from the bridge
+  and the window came up after the click.
+- New options: `verify: false` skips the read-back (about 100 ms faster), `checkWindow: false` skips the window
+  check.
+- The response adds `screenX`/`screenY` (the physical pixels clicked), `innerScreenX`/`innerScreenY`,
+  `devicePixelRatio`, `dpiAware` and `windowAtPoint`.
+
 ## 2.1.1
 
 Extension-only release (bridge unchanged at 2.1.0). Verified on a temporary Zen profile: 75/75 e2e.

@@ -43,7 +43,7 @@ except ImportError:
     from websockets.server import serve as ws_serve
 
 # ── Config ──
-BRIDGE_VERSION = "2.1.0"
+BRIDGE_VERSION = "2.1.2"
 API_VERSION = "1"
 HTTP_PORT = 8765
 WS_PORT = 8766
@@ -112,36 +112,125 @@ def _cache_clear(reason=None):
         _cache.clear()
 
 
-def _focus_window_by_title(title):
-    """Best-effort foreground focus for callers that explicitly ask for it."""
-    if not sys.platform.startswith("win") or not title:
-        return False
+_USER32 = None
 
-    user32 = ctypes.windll.user32
-    matches = []
+
+def _user32():
+    """user32 with HWND-safe signatures for the calls trustedClick makes."""
+    global _USER32
+    if _USER32 is None:
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        u.GetForegroundWindow.restype = wintypes.HWND
+        u.WindowFromPoint.argtypes = [wintypes.POINT]
+        u.WindowFromPoint.restype = wintypes.HWND
+        u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        u.GetAncestor.restype = wintypes.HWND
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        for name in ("IsWindowVisible", "IsIconic", "SetForegroundWindow", "BringWindowToTop"):
+            getattr(u, name).argtypes = [wintypes.HWND]
+        u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        _USER32 = u
+    return _USER32
+
+
+def _window_text(hwnd):
+    u = _user32()
+    n = u.GetWindowTextLengthW(hwnd)
+    if n <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(n + 1)
+    u.GetWindowTextW(hwnd, buf, n + 1)
+    return buf.value
+
+
+def _norm_title(s):
+    return " ".join((s or "").split())
+
+
+def _title_matches(page_title, window_title):
+    """Zen/Firefox window title = '<tab title> — Zen Browser'."""
+    p = _norm_title(page_title)[:80]
+    return bool(p) and p in _norm_title(window_title)
+
+
+def _window_at_point(x, y):
+    """Title of the top-level window under physical screen point (x, y)."""
+    from ctypes import wintypes
+    u = _user32()
+    hwnd = u.WindowFromPoint(wintypes.POINT(int(round(x)), int(round(y))))
+    if not hwnd:
+        return ""
+    root = u.GetAncestor(hwnd, 2) or hwnd  # GA_ROOT
+    return _window_text(root)
+
+
+def _focus_window_by_title(title):
+    """Best-effort foreground focus for callers that explicitly ask for it.
+
+    Returns the window handle it tried to raise (or None). 2.1.2: prefers a window whose title starts
+    with `title`, and attaches to the foreground thread first - a plain SetForegroundWindow from the
+    background bridge is usually refused by Windows' foreground lock, and the window then came up
+    *after* the click.
+    """
+    if not sys.platform.startswith("win") or not title:
+        return None
+
+    u = _user32()
+    want = _norm_title(title)
+    exact, loose = [], []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
     def enum_proc(hwnd, _):
-        if not user32.IsWindowVisible(hwnd):
+        if not u.IsWindowVisible(hwnd):
             return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
+        text = _norm_title(_window_text(hwnd))
+        if not text:
             return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        text = buf.value
-        if title in text or text in title:
-            matches.append(hwnd)
+        if text.startswith(want[:80]):
+            exact.append(hwnd)
+        elif want in text or text in want:
+            loose.append(hwnd)
         return True
 
-    user32.EnumWindows(enum_proc, 0)
+    u.EnumWindows(enum_proc, 0)
+    matches = exact or loose
     if not matches:
-        return False
+        return None
 
     hwnd = matches[0]
-    user32.SetForegroundWindow(hwnd)
-    time.sleep(0.05)
-    return user32.GetForegroundWindow() == hwnd
+    fg = u.GetForegroundWindow()
+    if fg == hwnd:
+        return hwnd
+    if u.IsIconic(hwnd):
+        u.ShowWindow(hwnd, 9)  # SW_RESTORE
+    cur = ctypes.windll.kernel32.GetCurrentThreadId()
+    fg_thread = u.GetWindowThreadProcessId(fg, None) if fg else 0
+    attached = bool(fg_thread and fg_thread != cur and u.AttachThreadInput(cur, fg_thread, True))
+    try:
+        u.BringWindowToTop(hwnd)
+        u.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            u.AttachThreadInput(cur, fg_thread, False)
+    return hwnd
+
+
+async def _focus_and_wait(title, timeout=0.6):
+    hwnd = _focus_window_by_title(title)
+    if not hwnd:
+        return False
+    end = time.time() + timeout
+    while True:
+        if _user32().GetForegroundWindow() == hwnd:
+            return True
+        if time.time() >= end:
+            return False
+        await asyncio.sleep(0.05)
 
 
 _NO_SCHEDULE_ACTIONS = {"ping", "getTabs", "getWindows"}
@@ -392,10 +481,51 @@ def _cleanup_tab_scheduler_state(tab_id):
         _tab_command_locks.pop(tab_id, None)
 
 
+_DPI_AWARE = None
+
+
+def _ensure_dpi_aware():
+    """Make SetCursorPos take physical pixels (what Firefox/Zen device pixels are).
+
+    2.1.2: a DPI-unaware process gets virtualized (logical) cursor coordinates on a scaled Windows
+    display, so the same physical point needed a different number per machine. Called once, before
+    the first click; the bridge creates no windows, so switching late is allowed.
+    """
+    global _DPI_AWARE
+    if _DPI_AWARE is not None:
+        return _DPI_AWARE
+    if not sys.platform.startswith("win"):
+        _DPI_AWARE = False
+        return False
+    ok = False
+    try:
+        fn = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        fn.argtypes = [ctypes.c_void_p]
+        fn.restype = ctypes.c_bool
+        ok = bool(fn(ctypes.c_void_p(-4)))  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    except Exception:
+        pass
+    if not ok:
+        try:
+            ok = ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0  # PROCESS_PER_MONITOR_DPI_AWARE
+        except Exception:
+            pass
+    if not ok:
+        try:
+            # already set (e.g. by an exe manifest) -> the calls above fail with access denied
+            ok = bool(ctypes.windll.user32.IsProcessDPIAware())
+        except Exception:
+            pass
+    _DPI_AWARE = ok
+    return ok
+
+
 def _native_click_screen(x, y):
+    """Move the real cursor to physical screen pixel (x, y) and left-click."""
     if not sys.platform.startswith("win"):
         return {"error": "trustedClick is only implemented on Windows"}
 
+    _ensure_dpi_aware()
     user32 = ctypes.windll.user32
     user32.SetCursorPos(int(round(x)), int(round(y)))
     time.sleep(0.05)
@@ -405,20 +535,72 @@ def _native_click_screen(x, y):
     return {"ok": True}
 
 
+# Shared page-side helpers for trustedClick (prepare + readback run as separate executeJS calls).
+_TRUSTED_CLICK_JS_HELPERS = r"""
+  const zlDescribe = (n) => {
+    if (!n || n.nodeType !== 1) return null;
+    const d = { tag: n.tagName.toLowerCase() };
+    if (n.id) d.id = n.id;
+    const cls = typeof n.className === 'string'
+      ? n.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).join(' ') : '';
+    if (cls) d.class = cls;
+    const label = n.getAttribute('aria-label') || n.getAttribute('data-testid') || '';
+    if (label) d.label = label.slice(0, 80);
+    const text = (n.innerText || n.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    if (text) d.text = text;
+    return d;
+  };
+  const zlCovers = (t, h) => {
+    if (!t || !h) return false;
+    if (t === h || t.contains(h)) return true;
+    const lab = h.closest ? h.closest('label') : null;  // clicking a <label> activates its control
+    return !!(lab && lab.control === t);
+  };
+"""
+
+
+async def _trusted_click_js(code, tab_id):
+    js_params = {"code": code}
+    if tab_id is not None:
+        js_params["tabId"] = tab_id
+    result = await send_to_extension("executeJS", js_params)
+    if not isinstance(result, dict):
+        return {"error": "trustedClick: bad executeJS reply", "raw": result}
+    if "error" in result:
+        return result
+    try:
+        return json.loads(result.get("result") or "{}")
+    except json.JSONDecodeError:
+        return {"error": "trustedClick could not parse page reply", "raw": result}
+
+
 async def trusted_click(params):
-    """Use a real OS-level mouse click at a browser viewport coordinate."""
+    """Use a real OS-level mouse click at a browser viewport coordinate.
+
+    2.1.2: viewport (CSS px) -> screen (physical px) now applies devicePixelRatio, which in
+    Firefox/Zen includes page zoom:  screen = (mozInnerScreenX + clientX) * devicePixelRatio.
+    (mozInnerScreenX/Y are CSS px too.) Before, a tab at 80% zoom got clicked ~25% too far
+    right/down and the call still said ok. The result now reports the element under the point
+    before the click and what the page actually received, and ok=false when the click missed.
+    """
     selector = params.get("selector") or ""
     coords = params.get("coords") or {}
     coordinate_space = params.get("coordinateSpace") or params.get("space") or "viewport"
     focus = params.get("focus", False)
+    verify = params.get("verify", True)
+    tab_id = params.get("tabId")
     x = params.get("x", coords.get("x"))
     y = params.get("y", coords.get("y"))
 
     if not selector and (x is None or y is None):
         return {"error": "trustedClick requires selector or x/y coordinates"}
 
+    is_win = sys.platform.startswith("win")
+    if is_win:
+        _ensure_dpi_aware()
+
     if coordinate_space == "screen":
-        focused = _focus_window_by_title(params.get("title") or "Zen Browser") if focus else False
+        focused = await _focus_and_wait(params.get("title") or "Zen Browser") if focus else False
         clicked = _native_click_screen(x, y)
         if "error" in clicked:
             return clicked
@@ -428,73 +610,234 @@ async def trusted_click(params):
             "coordinateSpace": "screen",
             "screenX": x,
             "screenY": y,
+            "dpiAware": _DPI_AWARE,
+            "windowAtPoint": _window_at_point(x, y) if is_win else None,
+            "verified": None,
+            "note": "screen coordinates are physical desktop pixels; the page is not checked",
             "focused": focused,
             "focusRequested": bool(focus),
         }
 
-    selector_json = json.dumps(selector)
-    x_json = json.dumps(x)
-    y_json = json.dumps(y)
-    code = f"""
+    token = os.urandom(6).hex()
+    prepare = f"""
 (() => {{
-  const selector = {selector_json};
-  let x = {x_json};
-  let y = {y_json};
-  const el = selector ? document.querySelector(selector) : null;
-  if (el) {{
+{_TRUSTED_CLICK_JS_HELPERS}
+  const selector = {json.dumps(selector)};
+  let x = {json.dumps(x)};
+  let y = {json.dumps(y)};
+  let el = null;
+  if (selector) {{
+    el = document.querySelector(selector);
+    if (!el) return JSON.stringify({{ error: 'Element not found: ' + selector }});
     el.scrollIntoView({{ behavior: 'instant', block: 'center', inline: 'center' }});
-    const rect = el.getBoundingClientRect();
-    x = rect.left + rect.width / 2;
-    y = rect.top + rect.height / 2;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return JSON.stringify({{ error: 'Element has no size (hidden?): ' + selector }});
+    x = r.left + r.width / 2;
+    y = r.top + r.height / 2;
   }}
   if (x == null || y == null) return JSON.stringify({{ error: 'No target point' }});
-  const viewportLeft = Number.isFinite(window.mozInnerScreenX)
-    ? window.mozInnerScreenX
-    : window.screenX + Math.max(0, (window.outerWidth - window.innerWidth) / 2);
-  const viewportTop = Number.isFinite(window.mozInnerScreenY)
-    ? window.mozInnerScreenY
-    : window.screenY + Math.max(0, window.outerHeight - window.innerHeight);
+  x = Number(x); y = Number(y);
+  const dpr = window.devicePixelRatio || 1;
+  const moz = Number.isFinite(window.mozInnerScreenX) && Number.isFinite(window.mozInnerScreenY);
+  // Firefox/Zen: mozInnerScreenX/Y = viewport origin on screen in CSS px (zoom included).
+  // Fallback (other engines) is a rough estimate of the browser chrome size.
+  const innerX = moz ? window.mozInnerScreenX : window.screenX + Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+  const innerY = moz ? window.mozInnerScreenY : window.screenY + Math.max(0, window.outerHeight - window.innerHeight);
+  const inViewport = x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight;
+  const at = inViewport ? document.elementFromPoint(x, y) : null;
+  const frame = !!(at && /^(IFRAME|FRAME|EMBED|OBJECT)$/.test(at.tagName));
+  const prev = window.__zlTrustedClick;
+  if (prev && prev.disarm) prev.disarm();
+  const rec = {{ token: {json.dumps(token)}, events: [], href: location.href, el, x, y }};
+  const types = ['pointerdown', 'mousedown', 'mouseup', 'click'];
+  const onEvt = (e) => {{
+    if (rec.events.length < 8) rec.events.push({{ type: e.type, trusted: e.isTrusted,
+      clientX: e.clientX, clientY: e.clientY, target: e.target }});
+  }};
+  types.forEach(t => window.addEventListener(t, onEvt, true));
+  rec.disarm = () => types.forEach(t => window.removeEventListener(t, onEvt, true));
+  setTimeout(rec.disarm, 5000);
+  window.__zlTrustedClick = rec;
   return JSON.stringify({{
     title: document.title,
+    hidden: document.hidden,
     viewportX: x,
     viewportY: y,
-    screenX: viewportLeft + x,
-    screenY: viewportTop + y,
-    devicePixelRatio: window.devicePixelRatio || 1
+    innerScreenX: innerX,
+    innerScreenY: innerY,
+    devicePixelRatio: dpr,
+    mozInnerScreen: moz,
+    screenX: Math.round((innerX + x) * dpr),
+    screenY: Math.round((innerY + y) * dpr),
+    inViewport,
+    target: el ? zlDescribe(el) : null,
+    elementAtPoint: zlDescribe(at),
+    frameAtPoint: frame,
+    hit: el ? zlCovers(el, at) : null
   }});
 }})()
 """
-    js_params = {"code": code}
-    if params.get("tabId") is not None:
-        js_params["tabId"] = params.get("tabId")
-    result = await send_to_extension("executeJS", js_params)
-    if "error" in result:
-        return result
-
-    try:
-        point = json.loads(result.get("result") or "{}")
-    except json.JSONDecodeError:
-        return {"error": "trustedClick could not parse browser point", "raw": result}
-
+    point = await _trusted_click_js(prepare, tab_id)
     if "error" in point:
         return point
 
-    focused = _focus_window_by_title(point.get("title", "")) if focus else False
-    clicked = _native_click_screen(point["screenX"], point["screenY"])
-    if "error" in clicked:
-        return clicked
-
-    return {
+    out = {
         "ok": True,
         "trusted": True,
+        "coordinateSpace": "viewport",
         "screenX": point["screenX"],
         "screenY": point["screenY"],
         "viewportX": point["viewportX"],
         "viewportY": point["viewportY"],
+        "innerScreenX": point.get("innerScreenX"),
+        "innerScreenY": point.get("innerScreenY"),
+        "devicePixelRatio": point.get("devicePixelRatio"),
+        "elementAtPoint": point.get("elementAtPoint"),
+        "hit": point.get("hit"),
         "title": point.get("title", ""),
-        "focused": focused,
-        "focusRequested": bool(focus),
     }
+    if selector:
+        out["target"] = point.get("target")
+    if not point.get("inViewport"):
+        out["warning"] = "point is outside the viewport"
+    elif point.get("hit") is False:
+        out["warning"] = "another element covers the target's center"
+
+    focused = await _focus_and_wait(point.get("title", "")) if focus else False
+    out["focused"] = focused
+    out["focusRequested"] = bool(focus)
+
+    # A background tab (or a minimized / fully covered window) can't receive a real click - the OS
+    # click would go to whatever is actually showing there.
+    hidden = bool(point.get("hidden"))
+    if hidden and focus:
+        end = time.time() + 0.5
+        while hidden and time.time() < end:
+            await asyncio.sleep(0.05)
+            vis = await _trusted_click_js("JSON.stringify({hidden: document.hidden})", tab_id)
+            hidden = bool(vis.get("hidden", True)) if "error" not in vis else True
+    if hidden:
+        out.update({
+            "ok": False,
+            "clicked": False,
+            "verified": False,
+            "error": ("not clicked: the tab is not visible (a background tab, or its window is minimized or "
+                      "covered). Switch to the tab and bring its window to the front first."),
+        })
+        return out
+
+    # 2.1.2 guard: a real click goes to whatever window is on top at that pixel. If that isn't the
+    # browser window showing this page (Zen behind another window, or a different Zen window in
+    # front), don't click at all - it would land in someone else's window.
+    page_title = point.get("title", "")
+    if is_win and params.get("checkWindow", True):
+        if _norm_title(page_title):
+            win_title = ""
+            end = time.time() + 0.5  # a just-raised window can take a moment to be on top
+            while True:
+                win_title = _window_at_point(point["screenX"], point["screenY"])
+                if _title_matches(page_title, win_title) or time.time() >= end:
+                    break
+                await asyncio.sleep(0.05)
+            out["windowAtPoint"] = win_title
+            if not _title_matches(page_title, win_title):
+                out.update({
+                    "ok": False,
+                    "clicked": False,
+                    "verified": False,
+                    "error": ("not clicked: the window at screen (%s, %s) is %r, not the browser window showing %r. "
+                              "Bring that Zen window to the front (or pass focus=true) and retry."
+                              % (point["screenX"], point["screenY"], win_title, page_title)),
+                })
+                return out
+        else:
+            out["windowAtPoint"] = _window_at_point(point["screenX"], point["screenY"])
+            out["note"] = "page has no title, so the window under the point could not be matched"
+
+    clicked = _native_click_screen(point["screenX"], point["screenY"])
+    if "error" in clicked:
+        return clicked
+    out["clicked"] = True
+    out["dpiAware"] = _DPI_AWARE
+
+    if not verify:
+        out["verified"] = None
+        return out
+
+    # Read back what the page received. Retry briefly: input events are async to the OS click.
+    readback_tpl = """
+(() => {
+%s
+  const rec = window.__zlTrustedClick;
+  if (!rec || rec.token !== %s) return JSON.stringify({ missing: true });
+  const trusted = rec.events.filter(e => e.trusted);
+  const done = trusted.some(e => e.type === 'click' || e.type === 'mouseup');
+  if (!%s && !done) return JSON.stringify({ pending: true });
+  rec.disarm();
+  window.__zlTrustedClick = null;
+  const first = trusted.find(e => e.type === 'pointerdown' || e.type === 'mousedown') || trusted[0];
+  return JSON.stringify({
+    events: trusted.map(e => e.type),
+    sameUrl: location.href === rec.href,
+    landed: first ? {
+      type: first.type,
+      clientX: Math.round(first.clientX * 10) / 10,
+      clientY: Math.round(first.clientY * 10) / 10,
+      dx: Math.round((first.clientX - rec.x) * 10) / 10,
+      dy: Math.round((first.clientY - rec.y) * 10) / 10,
+      target: zlDescribe(first.target),
+      onTarget: rec.el ? zlCovers(rec.el, first.target) : null
+    } : null
+  });
+})()
+"""
+    rb = None
+    deadline = time.time() + 0.8
+    while True:
+        await asyncio.sleep(0.08)
+        final = time.time() >= deadline
+        rb = await _trusted_click_js(
+            readback_tpl % (_TRUSTED_CLICK_JS_HELPERS, json.dumps(token), "true" if final else "false"),
+            tab_id)
+        if "error" in rb or not rb.get("pending") or final:
+            break
+
+    if "error" in rb or rb.get("missing"):
+        out["verified"] = None
+        out["note"] = "page changed before the check (navigation/reload), so the landing spot is unknown"
+        return out
+
+    landed = rb.get("landed")
+    out["landed"] = landed
+    out["events"] = rb.get("events", [])
+    if not landed:
+        if point.get("frameAtPoint"):
+            out["verified"] = None
+            out["note"] = "point is over an iframe; clicks inside frames can't be observed from the top page"
+            return out
+        out["verified"] = False
+        out["ok"] = False
+        out["error"] = ("trusted click missed: the page received no click at screen (%s, %s) - it probably hit "
+                        "browser chrome, another window, or a popup. Is Zen in front and not covered?"
+                        % (point["screenX"], point["screenY"]))
+        return out
+
+    dpr = float(point.get("devicePixelRatio") or 1)
+    tol = max(2.0, 1.0 / dpr + 0.5)  # one device pixel of rounding, in CSS px
+    near = abs(landed.get("dx") or 0) <= tol and abs(landed.get("dy") or 0) <= tol
+    if selector:
+        out["verified"] = bool(landed.get("onTarget"))
+    else:
+        out["verified"] = near
+    if not out["verified"]:
+        out["ok"] = False
+        where = landed.get("target") or {}
+        desc = where.get("tag", "?") + ("#" + where["id"] if where.get("id") else "")
+        out["error"] = ("trusted click missed: it landed on <%s> at viewport (%s, %s), %s px off the intended "
+                        "point (%s, %s)" % (desc, landed.get("clientX"), landed.get("clientY"),
+                                             "%s,%s" % (landed.get("dx"), landed.get("dy")),
+                                             round(point["viewportX"], 1), round(point["viewportY"], 1)))
+    return out
 
 
 def _log(msg):
@@ -2094,7 +2437,8 @@ loop = None
 async def main():
     global loop
     loop = asyncio.get_running_loop()
-    
+    _ensure_dpi_aware()  # 2.1.2: trustedClick works in physical pixels
+
     # Start WebSocket server
     # 2.1.0: websockets defaults to a 1 MiB message cap - a full-page screenshot is several MB and the
     # oversized frame closed the socket ("Extension disconnected"). Allow big frames.
